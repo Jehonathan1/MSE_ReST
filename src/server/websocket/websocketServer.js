@@ -2,89 +2,121 @@
 const WebSocket = require('ws');
 const net = require('net');
 const { EventEmitter } = require('events');
+const config = require('../config/config');
 
 class MSEWebSocketServer extends EventEmitter {
     constructor(httpServer) {
         super();
         
-        // Create WebSocket server attached to HTTP server
-        this.wss = new WebSocket.Server({ server: httpServer });
-        
-        // Track active connections
         this.clients = new Set();
-        
-        // Connection to MSE's PepTalk port
         this.mseSocket = null;
+        this.messageId = 1;
+        this.isConnecting = false;
+        this.reconnectTimeout = null;
         
-        // Initialize
-        this.initialize();
+        // Initialize WebSocket connection
+        this.connectToWebSocket();
     }
 
-    initialize() {
-        // Handle WebSocket connections
-        this.wss.on('connection', (ws) => this.handleConnection(ws));
-        
-        // Connect to MSE PepTalk server (default port 8594)
-        this.connectToMSE();
-    }
+    connectToWebSocket() {
+        if (this.isConnecting) return;
+        this.isConnecting = true;
 
-    connectToMSE() {
-        this.mseSocket = new net.Socket();
-
-        this.mseSocket.connect(8594, 'localhost', () => {
-            console.log('Connected to MSE PepTalk server');
+        try {
+            // Connect to MSE's WebSocket actor
+            console.log(`Connecting to MSE WebSocket actor at ws://${config.MSE_HOST}:${config.MSE_WEBSOCKET_PORT}`);
             
-            // Send initial protocol negotiation
-            this.mseSocket.write('protocol peptalk\r\n');
-        });
+            this.ws = new WebSocket(`ws://${config.MSE_HOST}:${config.MSE_WEBSOCKET_PORT}`);
 
-        this.mseSocket.on('data', (data) => {
-            // Broadcast MSE response to all connected clients
-            const message = data.toString('utf8');
-            this.broadcast(message);
-        });
+            this.ws.on('open', () => {
+                console.log('Connected to MSE WebSocket actor');
+                this.isConnecting = false;
+                
+                // Send protocol negotiation
+                this.sendCommand(`protocol ${config.PEPTALK_CAPABILITIES}`);
+                
+                // After protocol negotiation, start watching for state changes
+                this.sendCommand('get /directory/shows');  // Example command to test
+                
+                // Set up periodic status check
+                setInterval(() => {
+                    if (this.ws?.readyState === WebSocket.OPEN) {
+                        this.sendCommand('get /directory/shows');
+                    }
+                }, 5000);
+            });
 
-        this.mseSocket.on('error', (error) => {
-            console.error('MSE connection error:', error);
-            // Try to reconnect after a delay
-            setTimeout(() => this.connectToMSE(), 5000);
-        });
+            this.ws.on('message', (data) => {
+                const message = data.toString('utf8');
+                console.log('Received from MSE:', message);
+                this.handleMessage(message);
+            });
 
-        this.mseSocket.on('close', () => {
-            console.log('MSE connection closed');
-            // Try to reconnect after a delay
-            setTimeout(() => this.connectToMSE(), 5000);
-        });
+            this.ws.on('error', (error) => {
+                console.error('MSE WebSocket error:', error.message);
+                this.handleDisconnect();
+            });
+
+            this.ws.on('close', () => {
+                console.log('MSE WebSocket connection closed');
+                this.handleDisconnect();
+            });
+
+        } catch (error) {
+            console.error('Failed to connect to MSE:', error);
+            this.handleDisconnect();
+        }
     }
 
-    handleConnection(ws) {
-        console.log('New WebSocket client connected');
-        this.clients.add(ws);
+    handleDisconnect() {
+        this.isConnecting = false;
+        if (this.reconnectTimeout) {
+            clearTimeout(this.reconnectTimeout);
+        }
+        this.reconnectTimeout = setTimeout(() => this.connectToWebSocket(), 5000);
+    }
 
-        ws.on('message', (message) => {
-            try {
-                // Forward client message to MSE
-                if (this.mseSocket && this.mseSocket.writable) {
-                    this.mseSocket.write(message + '\r\n');
-                }
-            } catch (error) {
-                console.error('Error handling message:', error);
-                ws.send(JSON.stringify({
-                    type: 'error',
-                    data: { message: 'Failed to process command' }
-                }));
+    handleMessage(message) {
+        try {
+            console.log('Processing message:', message);
+            
+            // Handle protocol response
+            if (message.startsWith('1 protocol')) {
+                console.log('Protocol negotiation successful');
+                return;
             }
-        });
+            
+            // Handle error responses
+            if (message.includes('error')) {
+                console.error('Error from MSE:', message);
+                return;
+            }
 
-        ws.on('close', () => {
-            console.log('Client disconnected');
-            this.clients.delete(ws);
-        });
+            // Handle data responses
+            if (message.includes('<feed>') || message.includes('<entry>')) {
+                console.log('Received data feed');
+                this.broadcast(message);
+                return;
+            }
 
-        ws.on('error', (error) => {
-            console.error('WebSocket client error:', error);
-            this.clients.delete(ws);
-        });
+            // Log other messages for debugging
+            console.log('Unhandled message type:', message);
+        } catch (error) {
+            console.error('Error handling message:', error);
+        }
+    }
+
+    sendCommand(command) {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+            const msg = `${this.messageId} ${command}\r\n`;
+            console.log('Sending command:', msg);
+            this.ws.send(msg);
+            this.messageId++;
+            return true;
+        } else {
+            console.error('Cannot send command - not connected to MSE');
+            return false;
+        }
     }
 
     broadcast(message) {
@@ -95,40 +127,16 @@ class MSEWebSocketServer extends EventEmitter {
         });
     }
 
-    // Parse PepTalk messages into structured format
-    parsePepTalkMessage(message) {
-        try {
-            // Basic PepTalk message parsing
-            const lines = message.split('\r\n');
-            const command = lines[0];
-            const body = lines.slice(1).join('\r\n');
-
-            return {
-                command,
-                body,
-                raw: message
-            };
-        } catch (error) {
-            console.error('Error parsing PepTalk message:', error);
-            return null;
-        }
-    }
-
-    // Close all connections
     shutdown() {
-        if (this.mseSocket) {
-            this.mseSocket.end();
+        if (this.reconnectTimeout) {
+            clearTimeout(this.reconnectTimeout);
         }
         
-        this.clients.forEach(client => {
-            try {
-                client.close();
-            } catch (error) {
-                console.error('Error closing client connection:', error);
-            }
-        });
-        
-        this.wss.close();
+        if (this.ws?.readyState === WebSocket.OPEN) {
+            // Unregister from state changes
+            this.sendCommand('unregister NTK_states');
+            this.ws.close();
+        }
     }
 }
 

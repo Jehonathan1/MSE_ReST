@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const http = require('http');
-const MSEWebSocketServer = require('./websocketServer');
+const MSEWebSocketServer = require('./websocket/websocketServer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
