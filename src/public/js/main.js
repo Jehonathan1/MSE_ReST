@@ -1,3 +1,5 @@
+import WebSocketService from './WebSocketService';
+
 class MSEViewer {
     constructor() {
         // Initialize element references
@@ -21,6 +23,21 @@ class MSEViewer {
         this.loadInitialData();
     }
 
+    async setupWebSocket() {
+        try {
+            await WebSocketService.connect();
+            
+            // Register handlers for different message types
+            WebSocketService.on('shows', data => this.handleShowsUpdate(data));
+            WebSocketService.on('showDetails', data => this.handleShowDetails(data));
+            WebSocketService.on('playlistContent', data => this.handlePlaylistContent(data));
+            WebSocketService.on('error', error => this.handleError(error));
+        } catch (error) {
+            console.error('Failed to setup WebSocket:', error);
+            this.showError('Failed to connect to MSE server');
+        }
+    }
+
     setupEventListeners() {
         this.showSelect.addEventListener('change', () => this.handleShowSelection());
         this.playlistSelect.addEventListener('change', () => this.handlePlaylistSelection());
@@ -33,27 +50,8 @@ class MSEViewer {
 
     async loadInitialData() {
         try {
-            this.showsTableBody.innerHTML = `
-                <tr>
-                    <td colspan="6" class="text-center py-4">
-                        <div class="spinner-border text-primary" role="status">
-                            <span class="visually-hidden">Loading...</span>
-                        </div>
-                        <div class="mt-2">Loading data...</div>
-                    </td>
-                </tr>
-            `;
-
-            const [shows, profiles] = await Promise.all([
-                fetch('/api/shows').then(res => res.json()),
-                fetch('/api/profiles').then(res => res.json())
-            ]);
-
-            this.shows = shows;
-            this.profiles = profiles;
-
-            this.populateShowsDropdown();
-            this.populateShowsTable();
+            this.showLoadingState();
+            WebSocketService.getShows();
         } catch (error) {
             console.error('Failed to load initial data:', error);
             this.showError('Failed to load data');
@@ -228,38 +226,29 @@ class MSEViewer {
     }
 
     async executeCommand(command) {
-        if (!this.pageSelect.value || !this.profiles.length) return;
+        if (!this.pageSelect.value) return;
 
         try {
-            const profile = this.profiles[0];
-            const commandUrl = profile[`${command}Url`];
-            
-            if (!commandUrl) {
-                this.showError(`Command ${command} not available`);
-                return;
-            }
-
-            const response = await fetch('/api/profile-command', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    commandUrl,
-                    elementUrl: this.pageSelect.value
-                })
-            });
-
-            const result = await response.json();
-            if (result.success) {
-                this.showSuccess(`${command} command executed successfully`);
-            } else {
-                this.showError(result.error || `The ${command} command failed`);
-            }
+            WebSocketService.executeCommand(command, this.pageSelect.value);
+            this.showSuccess(`${command} command sent successfully`);
         } catch (error) {
             console.error(`Failed to execute ${command} command:`, error);
             this.showError(`Failed to execute ${command} command`);
         }
+
+    }
+
+    showLoadingState() {
+        this.showsTableBody.innerHTML = `
+            <tr>
+                <td colspan="6" class="text-center py-4">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <div class="mt-2">Loading data...</div>
+                </td>
+            </tr>
+        `;
     }
 
     async handleCleanup() {

@@ -1,18 +1,23 @@
+// index.js
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const apiRoutes = require('./routes/api');
+const http = require('http');
+const MSEWebSocketServer = require('./websocketServer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Create HTTP server instance
+const server = http.createServer(app);
+
+// Initialize WebSocket server
+const wss = new MSEWebSocketServer(server);
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
-
-// API Routes
-app.use('/api', apiRoutes);
 
 // Basic route for testing
 app.get('/test', (req, res) => {
@@ -28,7 +33,19 @@ app.use((err, req, res, next) => {
     });
 });
 
-app.listen(PORT, () => {
+// Start server
+server.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    console.log('Connected to MSE at http://localhost:8580');
+    console.log('WebSocket server available on ws://localhost:${PORT}');
+    console.log('Connected to MSE PepTalk server on localhost:8594');
+});
+
+// Handle graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received. Shutting down gracefully...');
+    wss.shutdown();
+    server.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+    });
 });
