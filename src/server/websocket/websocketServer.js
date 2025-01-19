@@ -8,11 +8,11 @@ class MSEWebSocketServer extends EventEmitter {
     constructor(httpServer) {
         super();
         
-        this.clients = new Set();
-        this.mseSocket = null;
+        this.ws = null;
         this.messageId = 1;
         this.isConnecting = false;
         this.reconnectTimeout = null;
+        this.monitorInterval = null;
         
         // Initialize WebSocket connection
         this.connectToWebSocket();
@@ -23,7 +23,6 @@ class MSEWebSocketServer extends EventEmitter {
         this.isConnecting = true;
 
         try {
-            // Connect to MSE's WebSocket actor
             console.log(`Connecting to MSE WebSocket actor at ws://${config.MSE_HOST}:${config.MSE_WEBSOCKET_PORT}`);
             
             this.ws = new WebSocket(`ws://${config.MSE_HOST}:${config.MSE_WEBSOCKET_PORT}`);
@@ -35,15 +34,8 @@ class MSEWebSocketServer extends EventEmitter {
                 // Send protocol negotiation
                 this.sendCommand(`protocol ${config.PEPTALK_CAPABILITIES}`);
                 
-                // After protocol negotiation, start watching for state changes
-                this.sendCommand('get /directory/shows');  // Example command to test
-                
-                // Set up periodic status check
-                setInterval(() => {
-                    if (this.ws?.readyState === WebSocket.OPEN) {
-                        this.sendCommand('get /directory/shows');
-                    }
-                }, 5000);
+                // Start monitoring state
+                this.startMonitoring();
             });
 
             this.ws.on('message', (data) => {
@@ -68,42 +60,187 @@ class MSEWebSocketServer extends EventEmitter {
         }
     }
 
-    handleDisconnect() {
-        this.isConnecting = false;
-        if (this.reconnectTimeout) {
-            clearTimeout(this.reconnectTimeout);
-        }
-        this.reconnectTimeout = setTimeout(() => this.connectToWebSocket(), 5000);
+    startMonitoring() {
+        this.queryStatus();
+        // Query status every 2 seconds
+        this.monitorInterval = setInterval(() => {
+            this.queryStatus();
+        }, 2000);
+    }
+
+    queryStatus() {
+        this.sendCommand('get /state'); // Get current show and profile state
     }
 
     handleMessage(message) {
         try {
-            console.log('Processing message:', message);
+            console.log('📥 Processing MSE message:', message);
             
-            // Handle protocol response
+            // Handle protocol negotiation
             if (message.startsWith('1 protocol')) {
-                console.log('Protocol negotiation successful');
-                return;
-            }
-            
-            // Handle error responses
-            if (message.includes('error')) {
-                console.error('Error from MSE:', message);
+                console.log('🤝 Protocol negotiation successful');
                 return;
             }
 
-            // Handle data responses
-            if (message.includes('<feed>') || message.includes('<entry>')) {
-                console.log('Received data feed');
-                this.broadcast(message);
+            // Handle dispatch_element messages (template takes)
+            if (message.includes('[dispatch_element]')) {
+                console.log('🎬 Found template action');
+                const action = this.parseTemplateAction(message);
+                if (action) {
+                    this.broadcast(JSON.stringify({
+                        type: 'action',
+                        data: action
+                    }));
+                }
                 return;
             }
 
-            // Log other messages for debugging
-            console.log('Unhandled message type:', message);
+            // Handle state response (show/profile info)
+            if (message.includes('state')) {
+                console.log('📊 Processing state info');
+                const state = this.parseState(message);
+                if (state) {
+                    if (state.show) {
+                        this.broadcast(JSON.stringify({
+                            type: 'currentShow',
+                            data: state.show
+                        }));
+                    }
+                    if (state.profile) {
+                        this.broadcast(JSON.stringify({
+                            type: 'currentProfile',
+                            data: state.profile
+                        }));
+                    }
+                }
+                return;
+            }
+
+            // Handle template content
+            if (message.includes('payload') && message.includes('field')) {
+                console.log('📄 Processing template content');
+                const content = this.parseTemplateContent(message);
+                if (content) {
+                    this.broadcast(JSON.stringify({
+                        type: 'templateContent',
+                        data: content
+                    }));
+                }
+                return;
+            }
+
+            console.log('⚠️ Unhandled message type:', message);
         } catch (error) {
             console.error('Error handling message:', error);
         }
+    }
+
+    parseState(message) {
+        try {
+            let state = {};
+            
+            // Extract show info from trio_clients entry
+            const showMatch = message.match(/show="([^"]*?)"/);
+            if (showMatch) {
+                const showPath = showMatch[1];
+                state.show = {
+                    name: showPath.split('/').pop(), // Get last part of path
+                    path: showPath,
+                    status: 'active'
+                };
+            }
+
+            // Extract profile info from trio_clients entry
+            const profileMatch = message.match(/profile="([^"]*?)"/);
+            if (profileMatch) {
+                state.profile = {
+                    name: profileMatch[1],
+                    status: 'active'
+                };
+            }
+
+            // If no matches found, try last_taken_element
+            if (!state.profile) {
+                const lastProfileMatch = message.match(/name="profile">([^<]*)<\/entry>/);
+                if (lastProfileMatch) {
+                    const profilePath = lastProfileMatch[1];
+                    state.profile = {
+                        name: profilePath.split('/').pop(), // Get last part of path
+                        status: 'active'
+                    };
+                }
+            }
+
+            console.log('Parsed state:', state);
+            return state;
+        } catch (error) {
+            console.error('Error parsing state:', error);
+            return null;
+        }
+    }
+
+    parseTemplateAction(message) {
+        try {
+            // [dispatch_element] <127.0.0.1:56419> [Brand()] Run (take) /storage/shows/{UUID}/elements/1003
+            const regex = /\[([^\]]+)\].*\[([^\]]+)\].*\((take|continue|out)\)\s+([^\s]+)/;
+            const match = message.match(regex);
+            
+            if (match) {
+                const action = {
+                    type: match[3],
+                    template: match[2],
+                    path: match[4],
+                    timestamp: new Date().toISOString()
+                };
+                
+                // Get template content
+                this.getTemplateContent(action.path);
+                
+                return action;
+            }
+            return null;
+        } catch (error) {
+            console.error('Error parsing template action:', error);
+            return null;
+        }
+    }
+
+    getTemplateContent(path) {
+        return this.sendCommand(`get ${path}`);
+    }
+
+    parseTemplateContent(message) {
+        try {
+            let content = [];
+            // Extract field values from the payload
+            const fields = message.match(/<field[^>]*>(.*?)<\/field>/g) || [];
+            
+            fields.forEach(field => {
+                const valueMatch = field.match(/<value[^>]*>(.*?)<\/value>/);
+                if (valueMatch) {
+                    content.push(valueMatch[1]);
+                }
+            });
+
+            return {
+                timestamp: new Date().toISOString(),
+                content: content
+            };
+        } catch (error) {
+            console.error('Error parsing template content:', error);
+            return null;
+        }
+    }
+
+    handleDisconnect() {
+        this.isConnecting = false;
+        if (this.monitorInterval) {
+            clearInterval(this.monitorInterval);
+        }
+        if (this.reconnectTimeout) {
+            clearTimeout(this.reconnectTimeout);
+        }
+        this.reconnectTimeout = setTimeout(() => this.connectToWebSocket(), 5000);
     }
 
     sendCommand(command) {
@@ -120,21 +257,22 @@ class MSEWebSocketServer extends EventEmitter {
     }
 
     broadcast(message) {
-        this.clients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(message);
-            }
-        });
+        try {
+            console.log('🔄 Broadcasting message to clients:', typeof message, message);
+            this.emit('broadcast', message);
+        } catch (error) {
+            console.error('❌ Error broadcasting message:', error);
+        }
     }
 
     shutdown() {
+        if (this.monitorInterval) {
+            clearInterval(this.monitorInterval);
+        }
         if (this.reconnectTimeout) {
             clearTimeout(this.reconnectTimeout);
         }
-        
         if (this.ws?.readyState === WebSocket.OPEN) {
-            // Unregister from state changes
-            this.sendCommand('unregister NTK_states');
             this.ws.close();
         }
     }
