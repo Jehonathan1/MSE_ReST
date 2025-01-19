@@ -87,28 +87,51 @@
         };
 
         function updateShow(show) {
+        if (show && show.name) {
             currentShow.textContent = show.name;
+            currentShow.className = 'mt-1 text-lg text-green-600 font-medium';
         }
-
-        function updateProfile(profile) {
+    }
+    function updateProfile(profile) {
+        if (profile && profile.name) {
             currentProfile.textContent = profile.name;
+            currentProfile.className = 'mt-1 text-lg text-blue-600 font-medium';
         }
+    }
 
         function addAction(action) {
             const actionElement = document.createElement('div');
-            actionElement.className = 'p-3 bg-gray-50 rounded border-l-4 border-blue-500';
+            actionElement.className = 'p-3 bg-gray-50 rounded border-l-4 border-blue-500 mb-2';
+            
+            // Color code different actions
+            const actionColors = {
+                'take': 'border-green-500',
+                'continue': 'border-blue-500',
+                'out': 'border-red-500',
+                'cleanup': 'border-yellow-500',
+                'initialize': 'border-purple-500'
+            };
+            
+            actionElement.className = `p-3 bg-gray-50 rounded border-l-4 mb-2 ${actionColors[action.type] || 'border-gray-500'}`;
+            
             actionElement.innerHTML = `
                 <div class="flex justify-between items-start">
-                    <div>
-                        <p class="font-medium">${action.template}</p>
-                        <p class="text-gray-600">Action: ${action.type}</p>
-                        <p class="text-sm text-gray-500">Loading content...</p>
+                    <div class="flex-grow">
+                        <div class="flex items-center gap-2">
+                            <span class="px-2 py-1 rounded text-sm ${getActionBadgeColor(action.type)}">
+                                ${action.type.toUpperCase()}
+                            </span>
+                            <p class="font-medium">${action.template}</p>
+                        </div>
+                        <p class="text-sm text-gray-600 mt-1">Loading content...</p>
+                        <div class="text-xs text-gray-500 mt-1">
+                            ${new Date(action.timestamp).toLocaleTimeString()}
+                        </div>
                     </div>
-                    <span class="text-sm text-gray-500">
-                        ${new Date().toLocaleTimeString()}
-                    </span>
                 </div>
             `;
+            
+            // Store action timestamp as ID for updating content later
             actionElement.id = `action-${action.timestamp}`;
 
             recentActions.insertBefore(actionElement, recentActions.firstChild);
@@ -120,12 +143,37 @@
         }
 
         function updateTemplateContent(content) {
-            // Find the most recent action and update its content
             const actionElement = recentActions.firstElementChild;
             if (actionElement) {
                 const contentP = actionElement.querySelector('.text-gray-600');
-                contentP.textContent = content.content.join(' | ');
+                if (contentP && content.fields) {
+                    // Format each field with its name and value
+                    const fieldsHtml = content.fields.map(field => `
+                        <div class="mb-1">
+                            <span class="font-medium">${field.field}:</span> 
+                            <span class="text-gray-700">${field.value}</span>
+                        </div>
+                    `).join('');
+                    
+                    contentP.innerHTML = `
+                        <div class="mt-2">
+                            <div class="font-medium text-gray-700">Template: ${content.template}</div>
+                            ${fieldsHtml}
+                        </div>
+                    `;
+                }
             }
+        }
+
+        function getActionBadgeColor(action) {
+            const colors = {
+                'take': 'bg-green-100 text-green-800',
+                'continue': 'bg-blue-100 text-blue-800',
+                'out': 'bg-red-100 text-red-800',
+                'cleanup': 'bg-yellow-100 text-yellow-800',
+                'initialize': 'bg-purple-100 text-purple-800'
+            };
+            return colors[action] || 'bg-gray-100 text-gray-800';
         }
     </script>
 </body>

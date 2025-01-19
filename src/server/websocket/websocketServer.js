@@ -181,8 +181,14 @@ class MSEWebSocketServer extends EventEmitter {
 
     parseTemplateAction(message) {
         try {
-            // [dispatch_element] <127.0.0.1:56419> [Brand()] Run (take) /storage/shows/{UUID}/elements/1003
-            const regex = /\[([^\]]+)\].*\[([^\]]+)\].*\((take|continue|out)\)\s+([^\s]+)/;
+            // Examples of messages we want to catch:
+            // [dispatch_element] <IP> [Brand()] Run (take) /path/to/element
+            // [dispatch_element] <IP> [Brand()] Run (continue) /path/to/element
+            // [dispatch_element] <IP> [Brand()] Run (out) /path/to/element
+            // [dispatch_element] <IP> [Brand()] Run (cleanup) /path/to/element
+            // [dispatch_element] <IP> [Brand()] Run (initialize) /path/to/element
+            
+            const regex = /\[([^\]]+)\].*\[([^\]]+)\].*\((take|continue|out|cleanup|initialize)\)\s+([^\s]+)/;
             const match = message.match(regex);
             
             if (match) {
@@ -193,7 +199,7 @@ class MSEWebSocketServer extends EventEmitter {
                     timestamp: new Date().toISOString()
                 };
                 
-                // Get template content
+                // Get the template content immediately
                 this.getTemplateContent(action.path);
                 
                 return action;
@@ -212,19 +218,36 @@ class MSEWebSocketServer extends EventEmitter {
     parseTemplateContent(message) {
         try {
             let content = [];
-            // Extract field values from the payload
-            const fields = message.match(/<field[^>]*>(.*?)<\/field>/g) || [];
+            let templateName = '';
+            
+            // Extract template name
+            const templateMatch = message.match(/template="([^"]*)"/);
+            if (templateMatch) {
+                templateName = templateMatch[1];
+            }
+            
+            // Extract all fields with their values
+            const fields = message.match(/<field[^>]*>([\s\S]*?)<\/field>/g) || [];
             
             fields.forEach(field => {
-                const valueMatch = field.match(/<value[^>]*>(.*?)<\/value>/);
+                // Get field name
+                const nameMatch = field.match(/name="([^"]*)"/);
+                const fieldName = nameMatch ? nameMatch[1] : '';
+                
+                // Get field value
+                const valueMatch = field.match(/<value[^>]*>([\s\S]*?)<\/value>/);
                 if (valueMatch) {
-                    content.push(valueMatch[1]);
+                    content.push({
+                        field: fieldName,
+                        value: valueMatch[1].trim()
+                    });
                 }
             });
 
             return {
                 timestamp: new Date().toISOString(),
-                content: content
+                template: templateName,
+                fields: content
             };
         } catch (error) {
             console.error('Error parsing template content:', error);
