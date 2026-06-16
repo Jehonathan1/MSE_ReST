@@ -1,35 +1,44 @@
 // src/recorder/adapters/trioAdapter.js
 //
-// Trio detection adapter — the **STOMP** channel-state (8582) detector. This is
-// the Stage-1 on-air/off-air path relocated behind the adapter interface; it is
-// functional, not a stub. Stage 2c can extend it (Trio-specific element shapes)
-// with zero core changes.
+// Trio detection adapter — the **STOMP** channel-state (8582) detector. The
+// channel-state walk is the proven logic from branch STOMP_VERSION_060425
+// ("MSE Template & Channel Monitor") — feed.entry.content['state:channel'].
+// state:layer(name=middle, type=transition_logic).state:transition_logic_layer[]
+// .@based_on -> active set; off-air = an element dropping out of that set
+// between frames — relocated behind the adapter interface and sharing the same
+// parseChannelState() the replay/test path uses.
 //
 // Signals, all derived from the channel-state feed:
 //   take    — an element entering the channel's active set
 //   off-air — an element dropping out of the active set
 //   state   — a compact snapshot of the active set, emitted on change
+// (A content *change* while an element stays on air is Pilot-sourced — the core's
+//  content-poll emits it as `change`; the channel-state feed carries set
+//  membership, not field content, exactly as in the proven branch.)
 //
-// IMPORTANT (the Stage-1 failure mode): at work the per-channel subscription used
-// a wrong channel name and the feed went silent, so no off-air fired. Here the
-// PRIMARY subscription is the GLOBAL `/feeds/channelstate` feed (channel-name
-// independent); the explicit per-channel subscription is a best-effort
-// supplement only. A wrong/unknown channel name therefore cannot disable
-// detection — and the Director adapter is the reliable off-air signal regardless.
+// DESTINATIONS (proven branch subscribeToProfile/subscribeToChannel/
+// subscribeToChannelStates):
+//   /feeds/channelstate                                    global, channel-name independent
+//   /state/profile/%2Fconfig%2Fprofiles%2F<profile>        profile state
+//   /state/channel/%2Fconfig%2Fprofiles%2F<profile>%2F<channel>   per-channel state
+//
+// The PRIMARY subscription is the GLOBAL `/feeds/channelstate` feed (the Stage-1
+// work capture went silent because the per-channel subscription used a wrong
+// channel name). The per-channel/profile subscriptions are best-effort
+// supplements, only built when --profile/--channel are configured. A
+// channel-state watchdog warns loudly if NOTHING arrives within a few seconds —
+// the only way round-1's silent wrong-channel failure could recur.
 //
 // CONTRACT (see ./index.js):
-//   - `source`      : 'trio'
-//   - `needsActor`  : false
-//   - `needsStomp`  : true   -> the core opens the STOMP client for it
-//   - emits 'take'    {elementId, templateId, isTemplate, basedOn}
-//   - emits 'off-air' {elementId}
-//   - emits 'state'   {channel, active:[{elementId, templateId, isTemplate}]}
-//   - attachStomp(subscribe)        : called once when STOMP connects;
-//                                     subscribe(destination, bodyCallback)
+//   - `source` 'trio'; `needsActor` false; `needsStomp` true
+//   - emits 'take'/'off-air' {elementId,...} and 'state' {channel, active[]}
+//   - attachStomp(subscribe) once on connect; subscribe(destination, bodyCallback)
 //   - stop()
 
 const { EventEmitter } = require('events');
 const { parseChannelState } = require('../parsers');
+
+const DEFAULT_CHANNEL_STATE_TIMEOUT_MS = 5000;
 
 class TrioAdapter extends EventEmitter {
   constructor({ cfg = {}, now = () => new Date().toISOString(), log = () => {} } = {}) {
@@ -46,28 +55,55 @@ class TrioAdapter extends EventEmitter {
     // element the Director adapter put on air (the core de-dupes across both).
     this.active = new Map();  // elementId -> { templateId, isTemplate }
     this.lastSig = null;
+
+    this.gotChannelState = false;
+    this.watchdog = null;
   }
 
   attachStomp(subscribe) {
     // PRIMARY: the global channel-state feed — independent of the channel name.
     subscribe('/feeds/channelstate', (body) => { if (body) this.handleChannelState(body); });
 
-    // SUPPLEMENT (best-effort): explicit per-channel state, only when the
-    // profile/channel names are configured. A wrong name here is harmless — the
-    // global feed above remains the primary source.
+    // SUPPLEMENT (best-effort): explicit profile + per-channel state, only when
+    // the names are configured. Built exactly as the proven branch builds them;
+    // a wrong name here is harmless — the global feed above remains primary.
     if (this.cfg.profile) {
       const enc = encodeURIComponent;
-      subscribe(`/state/profile/%2Fconfig%2Fprofiles%2F${enc(this.cfg.profile)}`, () => {});
+      const profileDest = `/state/profile/%2Fconfig%2Fprofiles%2F${enc(this.cfg.profile)}`;
+      subscribe(profileDest, () => {}); // profile metadata; not needed for set detection
+      this.log(`[trio] subscribed profile state: ${profileDest}`);
       if (this.cfg.channel) {
-        subscribe(
-          `/state/channel/%2Fconfig%2Fprofiles%2F${enc(this.cfg.profile)}%2F${enc(this.cfg.channel)}`,
-          (body) => { if (body) this.handleChannelState(body); }
-        );
+        const channelDest = `/state/channel/%2Fconfig%2Fprofiles%2F${enc(this.cfg.profile)}%2F${enc(this.cfg.channel)}`;
+        subscribe(channelDest, (body) => { if (body) this.handleChannelState(body); });
+        this.log(`[trio] subscribed channel state: ${channelDest}`);
+      } else {
+        this.log('[trio] --channel not set -> per-channel subscription skipped (global feed only)');
       }
+    } else {
+      this.log('[trio] --profile/--channel not set -> only the global /feeds/channelstate feed is subscribed');
     }
+
+    // Arm the watchdog: a wrong channel silently disabled detection in round 1.
+    const ms = this.cfg.channelStateTimeoutMs || DEFAULT_CHANNEL_STATE_TIMEOUT_MS;
+    this.watchdog = setTimeout(() => this._warnIfNoChannelState(), ms);
+    if (this.watchdog.unref) this.watchdog.unref(); // never hold the process open
+  }
+
+  // Called by the watchdog timer (and unit-tested directly).
+  _warnIfNoChannelState() {
+    if (this.gotChannelState) return;
+    const ms = this.cfg.channelStateTimeoutMs || DEFAULT_CHANNEL_STATE_TIMEOUT_MS;
+    this.log(`[trio] WARNING: no channel-state received within ${ms}ms — verify --profile/--channel `
+      + `(a wrong channel silently disabled detection in round 1). The Director adapter remains the `
+      + `reliable off-air signal; Trio take/off-air will not fire until channel-state arrives.`);
   }
 
   handleChannelState(body) {
+    if (!this.gotChannelState) {
+      this.gotChannelState = true;
+      if (this.watchdog) { clearTimeout(this.watchdog); this.watchdog = null; }
+    }
+
     const parsed = parseChannelState(body);
     const activeIds = parsed.active.map((a) => a.elementId);
     const sig = activeIds.slice().sort().join(',');
@@ -99,7 +135,9 @@ class TrioAdapter extends EventEmitter {
     }
   }
 
-  stop() { /* no timers; the core owns the STOMP client lifecycle */ }
+  stop() {
+    if (this.watchdog) { clearTimeout(this.watchdog); this.watchdog = null; }
+  }
 }
 
-module.exports = { TrioAdapter };
+module.exports = { TrioAdapter, DEFAULT_CHANNEL_STATE_TIMEOUT_MS };

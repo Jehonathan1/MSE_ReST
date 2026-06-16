@@ -1,0 +1,5 @@
+[
+  "* set text /scheduler/viz_program/external/pilotdb/elements/20001/handler/data/lines/LM-Line_1/state/current A",
+  "* set text /state/last_taken_element {64}<entry name=\"path\">/external/pilotdb/elements/20001</entry>",
+  "* set text /scheduler/viz_program/show/data/lines/LM-Line_1/state/current O"
+]

@@ -1,0 +1,4 @@
+[
+  "<?xml version=\"1.0\"?><feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:state=\"http://www.vizrt.com/types/state\"><entry><title>Main</title><content><state:channel><state:layer name=\"middle\" type=\"transition_logic\"><state:transition_logic_layer based_on=\"/external/pilotdb/elements/20001\"/></state:layer></state:channel></content></entry></feed>",
+  "<?xml version=\"1.0\"?><feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:state=\"http://www.vizrt.com/types/state\"><entry><title>Main</title><content><state:channel><state:layer name=\"middle\" type=\"transition_logic\"></state:layer></state:channel></content></entry></feed>"
+]

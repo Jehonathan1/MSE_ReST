@@ -123,6 +123,7 @@ class Recorder extends EventEmitter {
         profile: this.cfg.profile,
         channel: this.cfg.channel,
         source: this.cfg.source,
+        channelStateTimeoutMs: this.cfg.channelStateTimeoutMs,
         stripeTemplateId: this.cfg.stripeTemplateId,
         line1Field: this.cfg.line1Field,
         line2Field: this.cfg.line2Field,
