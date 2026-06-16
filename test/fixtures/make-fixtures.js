@@ -172,4 +172,133 @@ async function makeTakeout() {
   console.log(`wrote ${takeoutPath} (${lines.length} events) + stripe-takeout.actor.json`);
 }
 
-makeTakeout().catch((err) => { console.error(err); process.exit(1); });
+// --- Stage 2c: shared fixture drivers ----------------------------------------
+//
+// Each driver runs a REAL Recorder (Pilot join stubbed) over a scripted input and
+// commits both the detection INPUT and the recorder's JSONL OUTPUT, so the tests
+// assert against genuine recorder behaviour and replay.js reconstructs the file.
+
+const TEMPLATE_NONSTRIPE = '99999';
+
+function baseFixtureCfg(over = {}) {
+  return Object.assign({
+    mseHost: '127.0.0.1', stompPort: 8582, actorPort: 8595, restPort: 8580,
+    pilotHost: '10.0.0.5', pilotPort: 8177, profile: 'Office', channel: 'Main',
+    stripeTemplateId: TEMPLATE_ID, line1Field: '0', line2Field: '1', exclusiveField: '2',
+    outDir: 'recordings', pollIntervalMs: 2000, contentPoll: false, storeRaw: true,
+    durationSec: 0, pilotTimeoutMs: 5000, channelStateTimeoutMs: 60000,
+  }, over);
+}
+
+function sessionStart(cfg) {
+  return {
+    source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: {
+      mseHost: cfg.mseHost, stompPort: cfg.stompPort, actorPort: cfg.actorPort, restPort: cfg.restPort,
+      pilotHost: cfg.pilotHost, pilotPort: cfg.pilotPort, profile: cfg.profile, channel: cfg.channel,
+      source: cfg.source, channelStateTimeoutMs: cfg.channelStateTimeoutMs,
+      stripeTemplateId: cfg.stripeTemplateId, line1Field: cfg.line1Field, line2Field: cfg.line2Field, exclusiveField: cfg.exclusiveField,
+    },
+  };
+}
+
+function memEvents() {
+  const events = [];
+  return { events, writer: { filePath: '(mem)', count: 0, write(o) { events.push(o); this.count++; }, close() { return Promise.resolve(); } } };
+}
+
+const tick = () => new Promise((r) => setImmediate(r));
+
+// Drive a director scenario (source 'director') over scripted actor messages.
+async function driveDirector(name, actorMessages, minute) {
+  const { events, writer } = memEvents();
+  let t = 0;
+  const now = () => `2026-06-16T19:${minute}:${String(t++).padStart(2, '0')}.000Z`;
+  const cfg = baseFixtureCfg({ source: 'director' });
+  const rec = new Recorder(cfg, { writer, logger: () => {}, now });
+  // 1-line Stripe content for the Stripe element; non-stripe for anything else.
+  rec._fetchContent = async (id) => (String(id) === ELEMENT_ID
+    ? { content: content(L1a, '', ''), pending: false, error: null, raw: pilotXml(L1a, '', '') }
+    : { content: { elementId: String(id), templateId: TEMPLATE_NONSTRIPE, templateName: 'Other', fields: {}, texts: [] }, pending: false, error: null, raw: '<other/>' });
+
+  rec._record(sessionStart(cfg));
+  for (const msg of actorMessages) {
+    rec.adapters.forEach((a) => { if (a.needsActor) a.handleActorMessage(msg); });
+    await tick();
+  }
+  rec._record({ source: 'recorder', type: 'session', event: 'stop', eventCount: writer.count });
+
+  fs.writeFileSync(path.join(dir, `${name}.actor.json`), JSON.stringify(actorMessages, null, 2) + '\n');
+  fs.writeFileSync(path.join(dir, `${name}.jsonl`), events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  console.log(`wrote ${name}.actor.json + ${name}.jsonl (${events.length} events)`);
+}
+
+// A channel-state feed body with the given pilot element ids in the active
+// transition_logic layer (empty = nothing on air).
+function channelStateXml(ids) {
+  const layers = ids.map((id) => `<state:transition_logic_layer based_on="/external/pilotdb/elements/${id}"/>`).join('');
+  return '<?xml version="1.0"?>'
+    + '<feed xmlns="http://www.w3.org/2005/Atom" xmlns:state="http://www.vizrt.com/types/state">'
+    + `<entry><title>Main</title><content><state:channel>`
+    + `<state:layer name="middle" type="transition_logic">${layers}</state:layer>`
+    + '</state:channel></content></entry></feed>';
+}
+
+// Drive a Trio scenario (source 'trio'): channel-state take-in -> Pilot content
+// change while on air -> channel-state take-out (drops from the active set).
+async function makeTrio() {
+  const { events, writer } = memEvents();
+  let t = 0;
+  const now = () => `2026-06-16T19:40:${String(t++).padStart(2, '0')}.000Z`;
+  const cfg = baseFixtureCfg({ source: 'trio' });
+  const rec = new Recorder(cfg, { writer, logger: () => {}, now });
+  let cur = { content: content(L1a, '', ''), pending: false, error: null, raw: pilotXml(L1a, '', '') };
+  rec._fetchContent = async () => cur;
+
+  rec._record(sessionStart(cfg));
+  const trio = rec.adapters.find((a) => a.source === 'trio');
+  const bodyIn = channelStateXml([ELEMENT_ID]);
+  const bodyOut = channelStateXml([]);
+
+  trio.handleChannelState(bodyIn);                                  // take-in (1-line)
+  await tick();
+  cur = { content: content(L1b, L2, ''), pending: false, error: null, raw: pilotXml(L1b, L2, '') };
+  await rec._refreshOnAirContent();                                 // Pilot change -> 2-line
+  trio.handleChannelState(bodyOut);                                 // take-out (set empties)
+  await tick();
+  rec._record({ source: 'recorder', type: 'session', event: 'stop', eventCount: writer.count });
+
+  fs.writeFileSync(path.join(dir, 'stripe-trio.channelstate.json'), JSON.stringify([bodyIn, bodyOut], null, 2) + '\n');
+  fs.writeFileSync(path.join(dir, 'stripe-trio.jsonl'), events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  console.log(`wrote stripe-trio.channelstate.json + stripe-trio.jsonl (${events.length} events)`);
+}
+
+// Scheduler line paths: one carrying the element id, one without it.
+const LINE_WITH_ID = `/scheduler/viz_program/external/pilotdb/elements/${ELEMENT_ID}/handler/data/lines/LM-Line_1`;
+const LINE_NO_ID = '/scheduler/viz_program/show/data/lines/LM-Line_1';
+const LAST_TAKEN = `* set text /state/last_taken_element {64}<entry name="path">/external/pilotdb/elements/${ELEMENT_ID}</entry>`;
+
+async function main() {
+  await makeTakeout();
+  // (i) /state/system/log cleanup-driven OUT (no element id / line -> active element).
+  await driveDirector('stripe-cleanup', [
+    `* set text ${LINE_WITH_ID}/state/current A`,
+    LAST_TAKEN,
+    '* set text /state/system/log {72}Cleaning up viz-handlers for show /storage/shows/Brand on profile Brand',
+  ], '20');
+  // (ii) ID-less OUT resolved by scheduler line name (the O carries no element id).
+  await driveDirector('stripe-byline', [
+    `* set text ${LINE_WITH_ID}/state/current A`,
+    LAST_TAKEN,
+    `* set text ${LINE_NO_ID}/state/current O`,
+  ], '30');
+  // Official `delete` verb OUT (a node removed from the active state path).
+  await driveDirector('stripe-delete', [
+    `* set text ${LINE_WITH_ID}/state/current A`,
+    LAST_TAKEN,
+    `* delete ${LINE_WITH_ID}`,
+  ], '50');
+  await makeTrio();
+}
+
+main().catch((err) => { console.error(err); process.exit(1); });

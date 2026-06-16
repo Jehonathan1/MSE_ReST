@@ -1,3 +1,6 @@
 # Recorder fixtures are byte-sensitive (the truncated fixture is a deterministic
 # mid-line cut) — keep them LF everywhere so the regression is reproducible.
 *.jsonl text eol=lf
+# The actor / channel-state fixtures are committed recorder I/O too — pin LF so a
+# Windows checkout doesn't rewrite them to CRLF and show spurious modifications.
+test/fixtures/*.json text eol=lf

@@ -125,6 +125,9 @@ function resolveConfig(argv = process.argv.slice(2), env = process.env, cwd = pr
 
     outDir: pick('out', 'RECORD_DIR', 'recordings'),
     pollIntervalMs: num(pick('poll-interval', 'POLL_INTERVAL_MS', 2000), 2000),
+    // Trio watchdog: warn if no channel-state arrives within this window (a wrong
+    // --channel silently disabled detection in round 1). Detection-only; no retry.
+    channelStateTimeoutMs: num(pick('channel-state-timeout', 'CHANNEL_STATE_TIMEOUT_MS', 5000), 5000),
     // Re-fetch on-air Pilot content each poll to catch changes/exclusive while on air.
     contentPoll: pick('content-poll', null, true) !== false && pick('content-poll', null, true) !== 'false',
     storeRaw: pick('store-raw', null, true) !== false && pick('store-raw', null, true) !== 'false',

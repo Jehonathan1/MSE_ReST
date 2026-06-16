@@ -20,7 +20,7 @@ const {
 const { parseJsonl, reconstruct, replayFile, ReplayError } = require('../replay');
 const { Recorder } = require('../src/recorder/recorder');
 const { parseDirectorEvent } = require('../src/recorder/offair');
-const { DirectorAdapter, buildAdapters } = require('../src/recorder/adapters');
+const { DirectorAdapter, TrioAdapter, buildAdapters } = require('../src/recorder/adapters');
 
 // In-memory JSONL writer so we can unit-test the recorder's join logic without
 // touching the filesystem or a live MSE.
@@ -41,6 +41,48 @@ const FIX = path.join(__dirname, 'fixtures', 'stripe-lifecycle.jsonl');
 const FIX_TRUNC = path.join(__dirname, 'fixtures', 'stripe-lifecycle.truncated.jsonl');
 const FIX_TAKEOUT_ACTOR = path.join(__dirname, 'fixtures', 'stripe-takeout.actor.json');
 const FIX_TAKEOUT = path.join(__dirname, 'fixtures', 'stripe-takeout.jsonl');
+const FIX_CLEANUP_ACTOR = path.join(__dirname, 'fixtures', 'stripe-cleanup.actor.json');
+const FIX_BYLINE_ACTOR = path.join(__dirname, 'fixtures', 'stripe-byline.actor.json');
+const FIX_DELETE_ACTOR = path.join(__dirname, 'fixtures', 'stripe-delete.actor.json');
+const FIX_CLEANUP = path.join(__dirname, 'fixtures', 'stripe-cleanup.jsonl');
+const FIX_BYLINE = path.join(__dirname, 'fixtures', 'stripe-byline.jsonl');
+const FIX_DELETE = path.join(__dirname, 'fixtures', 'stripe-delete.jsonl');
+const FIX_TRIO = path.join(__dirname, 'fixtures', 'stripe-trio.jsonl');
+
+// A channel-state feed body with the given pilot element ids active.
+function channelStateXml(ids) {
+  const layers = ids.map((id) => `<state:transition_logic_layer based_on="/external/pilotdb/elements/${id}"/>`).join('');
+  return '<?xml version="1.0"?>'
+    + '<feed xmlns="http://www.w3.org/2005/Atom" xmlns:state="http://www.vizrt.com/types/state">'
+    + '<entry><title>Main</title><content><state:channel>'
+    + `<state:layer name="middle" type="transition_logic">${layers}</state:layer>`
+    + '</state:channel></content></entry></feed>';
+}
+
+// Drive a committed director actor-script fixture through a real Recorder (Pilot
+// stubbed to Stripe content) and return the recorded events — the shared body of
+// the Stage-2c director OUT proofs.
+async function runDirectorFixture(actorFixturePath) {
+  const msgs = JSON.parse(fs.readFileSync(actorFixturePath, 'utf8'));
+  const writer = memWriter();
+  let t = 0;
+  const now = () => `2026-06-16T21:00:${String(t++).padStart(2, '0')}.000Z`;
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', exclusiveField: '2' }),
+    { writer, logger: () => {}, now });
+  const stripe = { elementId: '20001', templateId: '16082', templateName: 'Stripe',
+    fields: { '0': 'ראש הממשלה נואם', '1': '', '2': '' }, texts: ['ראש הממשלה נואם'] };
+  rec._fetchContent = async (id) => (String(id) === '20001'
+    ? { content: stripe, pending: false, error: null, raw: '<xml/>' }
+    : { content: { elementId: String(id), templateId: '99999', templateName: 'Other', fields: {}, texts: [] }, pending: false, error: null, raw: '<o/>' });
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16082', line2Field: '1', source: 'director' } });
+  for (const msg of msgs) {
+    rec.adapters.forEach((a) => { if (a.needsActor) a.handleActorMessage(msg); });
+    await new Promise((r) => setImmediate(r));
+  }
+  rec._record({ source: 'recorder', type: 'session', event: 'stop', eventCount: writer.count });
+  return writer.events;
+}
 
 // --- Pilot-join parser: parse(pilotXml) must equal the committed content -----
 
@@ -292,4 +334,185 @@ test('committed stripe-takeout.jsonl replays to a complete (took→left) Stripe'
   assert.ok(result.stripe[0].leftAt, 'has an off-air / left time');
   assert.strictEqual(result.stripe[0].stillOnAir, false);
   assert.strictEqual(result.sessionStopped, true);
+});
+
+// === Stage 2c: official PepTalk OUT model (delete/replace/set verbs) =========
+
+test('parseDirectorEvent: official `delete` verb on the active state path => out', () => {
+  const ev = parseDirectorEvent('* delete /scheduler/viz_program/external/pilotdb/elements/20001/handler/data/lines/LM-Line_1');
+  assert.strictEqual(ev.action, 'out');
+  assert.strictEqual(ev.verb, 'delete');
+  assert.strictEqual(ev.elementId, '20001');
+  assert.strictEqual(ev.lineNumber, '1');
+  // a delete of an unrelated node must NOT be read as an off-air
+  assert.strictEqual(parseDirectorEvent('* delete /scheduler/log_level'), null);
+});
+
+test('parseDirectorEvent: official `replace` verb carries the new A/O state', () => {
+  const out = parseDirectorEvent('* replace /scheduler/s/external/pilotdb/elements/20001/lines/LM-Line_1/state {40}<entry name="state">O</entry>');
+  assert.strictEqual(out.action, 'out');
+  assert.strictEqual(out.verb, 'replace');
+  assert.strictEqual(out.elementId, '20001');
+  const take = parseDirectorEvent('* replace /scheduler/s/external/pilotdb/elements/20001/lines/LM-Line_1/state {40}<entry name="state">A</entry>');
+  assert.strictEqual(take.action, 'take');
+});
+
+test('parseDirectorEvent: system-log "Cleaning up viz-handlers" => out (KB §4b fallback)', () => {
+  const ev = parseDirectorEvent('* set text /state/system/log {72}Cleaning up viz-handlers for show /storage/shows/Brand on profile Brand');
+  assert.strictEqual(ev.action, 'out');
+  assert.strictEqual(ev.rule, 'system_log_cleanup');
+  assert.strictEqual(ev.elementId, null); // no element id / line in the cleanup line
+  assert.strictEqual(ev.lineName, null);
+});
+
+test('DirectorAdapter begin-framing: events inside our own command window are suppressed', () => {
+  const a = new DirectorAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  const offs = [];
+  a.on('off-air', (o) => offs.push(o));
+  a.currentActiveElementId = '20001';
+  // Simulate a subscribe whose own begin..ok bracket carries an initial O snapshot.
+  a.pending.set(7, 'subscribe');
+  a.handleActorMessage('7 begin');
+  a.handleActorMessage('* set text /scheduler/s/lines/LM-Line_1/state/current O'); // self-caused
+  assert.strictEqual(offs.length, 0, 'self-caused (own-begin) events must not fire off-air');
+  a.handleActorMessage('7 ok');
+  // After the window closes, an external O is honored.
+  a.handleActorMessage('* set text /scheduler/s/lines/LM-Line_1/state/current O');
+  assert.strictEqual(offs.length, 1);
+  assert.strictEqual(offs[0].elementId, '20001');
+});
+
+test('DirectorAdapter line-name cross-reference resolves an ID-less OUT (not the active element)', () => {
+  const a = new DirectorAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  const offs = [];
+  a.on('off-air', (o) => offs.push(o));
+  // take 'A' carrying BOTH the element id and its line -> records LM-Line_3 -> 20002
+  a.handleActorMessage('* set text /scheduler/s/external/pilotdb/elements/20002/lines/LM-Line_3/state/current A');
+  // make the active element someone ELSE, so the fallback would resolve wrong
+  a.currentActiveElementId = '99999';
+  // an ID-less O on LM-Line_3 must resolve to 20002 by line name, NOT 99999
+  a.handleActorMessage('* set text /scheduler/s/show/lines/LM-Line_3/state/current O');
+  assert.deepStrictEqual(offs, [{ elementId: '20002' }]);
+});
+
+test('DirectorAdapter cleanup OUT attributes to the active element', () => {
+  const a = new DirectorAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  const offs = [];
+  a.on('off-air', (o) => offs.push(o));
+  a.handleActorMessage('* set text /state/last_taken_element {1}<entry name="path">/external/pilotdb/elements/20001</entry>');
+  a.handleActorMessage('* set text /state/system/log {72}Cleaning up viz-handlers for show /storage/shows/Brand on profile Brand');
+  assert.deepStrictEqual(offs, [{ elementId: '20001' }]);
+});
+
+// New committed director fixtures: each emits a director-sourced off-air and
+// replay reconstructs a complete (took -> left) Stripe instance.
+for (const [label, actorFix, outFix] of [
+  ['cleanup (system-log)', FIX_CLEANUP_ACTOR, FIX_CLEANUP],
+  ['by-line (ID-less O)', FIX_BYLINE_ACTOR, FIX_BYLINE],
+  ['delete (official verb)', FIX_DELETE_ACTOR, FIX_DELETE],
+]) {
+  test(`director OUT via ${label}: recorder emits director off-air; replay took→left`, async () => {
+    const events = await runDirectorFixture(actorFix);
+    const take = events.find((e) => e.type === 'take');
+    const off = events.find((e) => e.type === 'off-air');
+    assert.ok(take && take.source === 'director' && take.isStripe, 'a director Stripe take');
+    assert.ok(off, `${label} MUST emit an off-air`);
+    assert.strictEqual(off.source, 'director');
+    assert.strictEqual(off.elementId, '20001');
+    assert.strictEqual(off.isStripe, true);
+    const inst = reconstruct(events).stripe;
+    assert.strictEqual(inst.length, 1);
+    assert.ok(inst[0].tookAt && inst[0].leftAt && !inst[0].stillOnAir, 'complete took→left');
+  });
+
+  test(`committed ${outFix.split(/[\\/]/).pop()} replays to a complete Stripe`, () => {
+    const result = replayFile(outFix);
+    assert.strictEqual(result.stripe.length, 1);
+    assert.ok(result.stripe[0].leftAt);
+    assert.strictEqual(result.stripe[0].stillOnAir, false);
+  });
+}
+
+// === Stage 2c: Trio adapter hardening =======================================
+
+test('TrioAdapter emits normalized take/off-air tagged source:trio; change is Pilot-sourced', async () => {
+  const writer = memWriter();
+  let t = 0;
+  const now = () => `2026-06-16T22:00:${String(t++).padStart(2, '0')}.000Z`;
+  const rec = new Recorder(baseCfg({ source: 'trio', pilotHost: '10.0.0.5', channelStateTimeoutMs: 60000 }),
+    { writer, logger: () => {}, now });
+  let cur = { content: { templateId: '16082', fields: { '0': 'a', '1': '' }, texts: ['a'] }, pending: false, error: null, raw: '<x/>' };
+  rec._fetchContent = async () => cur;
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16082', line2Field: '1', source: 'trio' } });
+  const trio = rec.adapters.find((a) => a.source === 'trio');
+
+  trio.handleChannelState(channelStateXml(['20001']));      // take-in
+  await new Promise((r) => setImmediate(r));
+  cur = { content: { templateId: '16082', fields: { '0': 'a', '1': 'b' }, texts: ['a', 'b'] }, pending: false, error: null, raw: '<x/>' };
+  await rec._refreshOnAirContent();                          // Pilot change while on air
+  trio.handleChannelState(channelStateXml([]));              // take-out (set empties)
+  rec._record({ source: 'recorder', type: 'session', event: 'stop', eventCount: writer.count });
+
+  const take = writer.events.find((e) => e.type === 'take');
+  const change = writer.events.find((e) => e.type === 'change');
+  const off = writer.events.find((e) => e.type === 'off-air');
+  assert.strictEqual(take.source, 'trio');
+  assert.strictEqual(take.variant, 'ONE_LINE');
+  assert.strictEqual(change.source, 'pilot');     // content change is Pilot-sourced by architecture
+  assert.strictEqual(change.variant, 'TWO_LINE');
+  assert.strictEqual(off.source, 'trio');
+  assert.strictEqual(off.elementId, '20001');
+  // replay reconstructs the full lifecycle
+  const inst = reconstruct(writer.events).stripe;
+  assert.strictEqual(inst.length, 1);
+  assert.ok(inst[0].tookAt && inst[0].leftAt && !inst[0].stillOnAir);
+});
+
+test('committed stripe-trio.jsonl replays to a complete (took→change→left) Stripe', () => {
+  const result = replayFile(FIX_TRIO);
+  assert.strictEqual(result.stripe.length, 1);
+  const kinds = result.stripe[0].timeline.map((t) => t.kind);
+  assert.deepStrictEqual(kinds, ['take', 'change', 'off-air']); // 1-line take -> 2-line change -> out
+  const onAir = result.stripe[0].timeline.filter((t) => t.kind !== 'off-air');
+  assert.deepStrictEqual(onAir.map((t) => t.variant), ['ONE_LINE', 'TWO_LINE']);
+  assert.strictEqual(result.stripe[0].stillOnAir, false);
+});
+
+test('TrioAdapter watchdog warns when no channel-state arrives, stays silent once it does', () => {
+  const logs = [];
+  const a = new TrioAdapter({ cfg: { channelStateTimeoutMs: 50 }, now: () => 't', log: (m) => logs.push(m) });
+  a._warnIfNoChannelState();
+  assert.ok(logs.some((l) => /no channel-state/i.test(l)), 'warns when nothing has arrived');
+  logs.length = 0;
+  a.handleChannelState(channelStateXml(['20001'])); // a channel-state arrives -> flag set
+  a._warnIfNoChannelState();
+  assert.ok(!logs.some((l) => /no channel-state/i.test(l)), 'silent once channel-state has been seen');
+});
+
+// === Stage 2c: --source auto cross-adapter de-dupe ==========================
+
+test('--source auto records a take/out seen by BOTH director and trio exactly once', async () => {
+  const writer = memWriter();
+  let t = 0;
+  const now = () => `2026-06-16T23:00:${String(t++).padStart(2, '0')}.000Z`;
+  const rec = new Recorder(baseCfg({ source: 'auto', pilotHost: '10.0.0.5', channelStateTimeoutMs: 60000 }),
+    { writer, logger: () => {}, now });
+  rec._fetchContent = async () => ({ content: { templateId: '16082', fields: { '0': 'a', '1': '' }, texts: ['a'] }, pending: false, error: null, raw: '<x/>' });
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16082', line2Field: '1', source: 'auto' } });
+  const director = rec.adapters.find((a) => a.source === 'director');
+  const trio = rec.adapters.find((a) => a.source === 'trio');
+
+  // Both legs report the SAME element taking on air.
+  director.handleActorMessage('* set text /scheduler/s/external/pilotdb/elements/20001/lines/LM-Line_1/state/current A');
+  director.handleActorMessage('* set text /state/last_taken_element {1}<entry name="path">/external/pilotdb/elements/20001</entry>');
+  trio.handleChannelState(channelStateXml(['20001']));
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(writer.events.filter((e) => e.type === 'take').length, 1, 'one take, not two');
+
+  // Both legs report it going off air.
+  director.handleActorMessage('* set text /scheduler/s/external/pilotdb/elements/20001/lines/LM-Line_1/state/current O');
+  trio.handleChannelState(channelStateXml([]));
+  assert.strictEqual(writer.events.filter((e) => e.type === 'off-air').length, 1, 'one off-air, not two');
 });

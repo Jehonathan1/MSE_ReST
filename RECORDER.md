@@ -41,30 +41,93 @@ signals, so the two adapters never double-record the same element. Adding a new
 detector (e.g. Stage 2c's Trio extensions) needs no core change — it just
 implements the adapter contract and emits `take`/`off-air`.
 
-### Off-air detection (the Stage-2b fix)
+### Which source for which show
+
+**Viz Director shows → `--source director`** (PepTalk actor `/scheduler` events);
+**Viz Trio shows → `--source trio`** (STOMP `/feeds/channelstate`). `--source auto`
+(default) runs **both** and the core's on-air map de-dupes overlapping signals, so
+it is the safe choice when you don't know which program is driving.
+
+### Director OUT detection — the official PepTalk model (primary) + KB fallbacks
 
 The Stage-1 recorder detected **take** (from the actor `last_taken_element`) but
 never captured a **take-out**: off-air was STOMP-driven, and at work the STOMP
 channel-state feed was silent (the per-channel subscription used a wrong channel
-name), so no off-air fired. The Director adapter fixes this by reading off-air
-from the **actor director stream** instead, ported from the `director-with-out`
-branch's `checkForOffAirActions()`:
+name), so no off-air fired. The Director adapter reads off-air from the **actor
+event stream** instead.
 
-- It negotiates `protocol peptalk events uri` (events **enabled** — Stage 1 used
-  `noevents`, so it never saw an `out`) and subscribes to `/scheduler`,
-  `/scheduler/*/state/current`,
-  `/scheduler/*/element/*/lines/LM-Line_*/state/current` and `/state/playout`.
-- An element's on-air state arrives on its scheduler **line** path as a single
-  letter — **`state/current A` ⇒ take, anything else (`O` / `current out`) ⇒
-  out** (`src/recorder/offair.js`). The element id is read from the message
-  (`…/pilotdb/elements/<id>`) or, when absent, attributed to the current active
-  element.
-- This signal is keyed on the **element path**, not the channel **name** — so a
-  wrong/unknown `--channel` can no longer silently disable off-air detection. The
-  STOMP per-channel subscription is now a best-effort *supplement* (the global
-  `/feeds/channelstate` feed is Trio's primary source); the Director adapter is
-  the reliable off-air signal. The recorder logs which signal fired
-  (`[director] OFF-AIR signal …` / `[trio] off-air signal …`).
+**Primary — the official Media Sequencer PepTalk event model** (Vizrt *"Media
+Sequencer document and API"*, §*The PepTalk Protocol*). With events enabled the
+server reflects every VDOM change as a uri-form event using one of **five verbs —
+`delete` / `insert` / `move` / `replace` / `set`**, serialized identically to the
+client commands. An element going **off air** surfaces as:
+
+- `* set text <path>/state/current O` — a **`set`** on its transition-logic state
+  node (active `A` → inactive `O`); `A` is the corresponding **take**;
+- `* replace <path> <…state…O…>` — a **`replace`** to the inactive state;
+- `* delete <path>` — a **`delete`** removing it from the active state path.
+
+Two protocol points the official doc pins down:
+
+- **Events must be enabled.** We negotiate `protocol peptalk events uri` — *not*
+  `noevents`. Per §*Protocol command*, `noevents` means "the client does not
+  require events that are not direct results of its own commands", so Stage-1's
+  `noevents` could never see an external operator's OUT. `uri` makes the server
+  serialize events in **path form** so each one names its element/line.
+- **External vs. our own events.** "Before sending any of the events that a
+  command causes, the server will send a `<id> begin` message … this can be used
+  to detect whether an event is caused by you or not." Events inside one of our
+  own command's `begin … ok` windows (e.g. a `subscribe`'s initial-state
+  snapshot) are **self-caused** and are suppressed; `*` events with no preceding
+  own-`begin` are **external** — the read-only operator/Director signal we want.
+  Since the recorder only sends `protocol`/`get`/`subscribe` (never a mutating
+  verb), in practice every change-event it sees is external; the begin-guard
+  still protects against a subscribe snapshot masquerading as a live take.
+
+**Fallbacks — the branch `director-with-out` / KB §4b heuristics** (kept for
+installs that surface the OUT differently; where they differ from the official
+model, the official model wins):
+
+- `* set text <path>/current out` — explicit out-command form;
+- `STATE_<entry name="LINE">…<entry name="state">O</entry>` — XML state form;
+- **`/state/system/log` `Cleaning up viz-handlers…show…profile…`** — a show/profile
+  **teardown** OUT that carries no element id or line; attributed to the active
+  element. (Subscribed via `/state/system/log`.)
+
+**Element-id resolution for an OUT** (`src/recorder/offair.js` classifies; the
+adapter attributes), in order: (1) the id named in the event
+(`…/pilotdb/elements/<id>`); else (2) **cross-reference the scheduler line name**
+against the adapter's on-air line map (built from take `A` events that carry both
+id and `LM-Line_*`); else (3) the current active element. So an **ID-less OUT** is
+still resolved correctly, and — because every signal is keyed on the **element /
+line path, not the channel name** — a wrong/unknown `--channel` can no longer
+silently disable off-air detection. The recorder logs which signal fired and how
+it resolved (`[director] OFF-AIR signal (rule/verb) element … via id|line-name|active-element`).
+
+Subscriptions: `/scheduler` (covers its subtree),
+`/scheduler/*/state/current`, `/scheduler/*/element/*/lines/LM-Line_*/state/current`,
+`/state/system/log`, `/state/playout`.
+
+### Trio off-air detection — STOMP channel-state (off-air by absence)
+
+The Trio adapter is the proven `STOMP_VERSION_060425` channel-state logic behind
+the adapter interface, sharing the same `parseChannelState()` the replay/test path
+uses. It walks
+`feed.entry.content['state:channel'].state:layer(name=middle, type=transition_logic)
+.state:transition_logic_layer[].@based_on` → the active set; **off-air = an element
+dropping out of that set** between frames. Destinations (proven branch):
+
+- `/feeds/channelstate` — **primary**, global, channel-name independent;
+- `/state/profile/%2Fconfig%2Fprofiles%2F<profile>` — profile state (supplement);
+- `/state/channel/%2Fconfig%2Fprofiles%2F<profile>%2F<channel>` — per-channel
+  state (supplement, only when `--profile`/`--channel` are set).
+
+A wrong `--channel` is harmless (the global feed remains primary), but round-1's
+silent failure *was* a wrong channel — so a **watchdog** now warns loudly if no
+channel-state arrives within `--channel-state-timeout` ms (default 5000):
+`[trio] WARNING: no channel-state received within …`. A content **change** while an
+element stays on air is **Pilot-sourced** (the core's content-poll emits it as
+`change`); the channel-state feed carries set membership, not field content.
 
 ## Quick start
 
@@ -86,7 +149,7 @@ node record.js \
 node replay.js recordings/<timestamp>.jsonl
 node replay.js recordings/<timestamp>.jsonl --json     # machine-readable
 
-npm test               # offline regression (fixtures + replay + adapters), 19 tests
+npm test               # offline regression (fixtures + replay + adapters), 35 tests
 ```
 
 npm script aliases: `npm run record -- <flags>`, `npm run replay -- <file>`, `npm test`.
@@ -113,6 +176,7 @@ Stripe is hard-coded — profile, channel, Pilot host and template id are all ar
 | `--exclusive-field` | `EXCLUSIVE_FIELD` | *(unset)* | Pilot field for the exclusive ("בלעדי") badge. |
 | `--out` | `RECORD_DIR` | `recordings` | Output directory. |
 | `--poll-interval` | `POLL_INTERVAL_MS` | `2000` | Actor poll + on-air content re-check interval (ms). |
+| `--channel-state-timeout` | `CHANNEL_STATE_TIMEOUT_MS` | `5000` | Trio watchdog: warn if no STOMP channel-state arrives within this window (a wrong `--channel` silently disabled detection in round 1). Detection-only; no retry. |
 | `--no-content-poll` | — | on | Disable re-fetching on-air Pilot content (change/exclusive detection). |
 | `--no-store-raw` | — | on | Stop embedding raw Pilot XML in take/change events. |
 | `--duration` | — | *(until Ctrl-C)* | Auto-stop after N seconds. |
@@ -187,7 +251,19 @@ Stripe instance #1  element 20001  template 16082
   proving the Stage-2b off-air detection ahead of the office capture.
 - `test/fixtures/stripe-takeout.jsonl` — that recorder run's committed output, so
   `node replay.js test/fixtures/stripe-takeout.jsonl` reconstructs the lifecycle.
-- Regenerate the fixtures with `npm run make-fixtures`.
+- **Stage 2c Director OUT fixtures** — each an actor-script `*.actor.json` (detection
+  input) + the recorder's `*.jsonl` (output), all reconstructing a complete
+  took→left Stripe and emitting a `director`-sourced off-air:
+  - `stripe-cleanup.*` — a `/state/system/log` `Cleaning up viz-handlers…` teardown
+    OUT (no element id/line → attributed to the active element);
+  - `stripe-byline.*` — an **ID-less** `set text …/state/current O` resolved by the
+    scheduler **line name**;
+  - `stripe-delete.*` — the official **`delete`** verb removing the element from the
+    active state path.
+- **Stage 2c Trio fixture** — `stripe-trio.channelstate.json` (the take-in/out
+  channel-state bodies) + `stripe-trio.jsonl`: a `trio`-sourced take → Pilot
+  `change` (1-line→2-line) → `trio` off-air, reconstructing the lifecycle.
+- Regenerate all fixtures with `npm run make-fixtures`.
 
 ## Standing TODO — the exclusive ("בלעדי") field number
 
