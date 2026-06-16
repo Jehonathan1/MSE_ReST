@@ -1,2 +1,5 @@
 node_modules
 .env
+
+# Live recordings — keep the repo clean; office captures live outside git.
+recordings/
