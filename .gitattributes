@@ -1,0 +1,3 @@
+# Recorder fixtures are byte-sensitive (the truncated fixture is a deterministic
+# mid-line cut) — keep them LF everywhere so the regression is reproducible.
+*.jsonl text eol=lf
