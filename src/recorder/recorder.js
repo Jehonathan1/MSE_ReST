@@ -1,14 +1,20 @@
 // src/recorder/recorder.js
 //
-// Read-only MSE recorder. Joins the three streams the convergence bridge needs
-// and writes one JSON object per line (JSONL) to a timestamped file:
+// Read-only MSE recorder. Owns the live connections, runs one or more detection
+// adapters over them, joins Pilot content, and writes one JSON object per line
+// (JSONL) to a timestamped file:
 //
-//   1. STOMP channel-state (8582)  -> on-air / off-air per element  (stompClient.js logic)
-//   2. PepTalk actor      (8595)   -> explicit take signal via last_taken_element
-//   3. Pilot REST         (8177)   -> field content joined on every take (work-only)
+//   - PepTalk actor (8595)        -> Director adapter (take + off-air)
+//   - STOMP channel-state (8582)  -> Trio adapter (take + off-air + state)
+//   - Pilot REST (8177)           -> field content joined on every take/change
 //
-// It is strictly read-only: STOMP CONNECT/SUBSCRIBE, actor `protocol`+`get`,
-// axios GET to Pilot/MSE REST. There is no take/cue/clear/POST path anywhere.
+// Detection lives in the adapters (src/recorder/adapters/); the CORE here keeps
+// the Pilot join, variant/exclusive derivation, the JSONL writer, the on-air map
+// (which de-dupes overlapping signals from multiple adapters) and the change
+// content-poll. Adapters only DETECT and hand normalized references to the core.
+//
+// It is strictly read-only: STOMP CONNECT/SUBSCRIBE, actor `protocol`+`get`+
+// `subscribe`, axios GET to Pilot/MSE REST. There is no take/cue/clear/POST path.
 //
 // When the Pilot host is unset or unreachable, takes are still recorded with
 // content:null + contentPending:true + the unresolved element reference, so the
@@ -23,12 +29,11 @@ const W3CWebSocket = require('websocket').w3cwebsocket;
 
 const {
   parsePilotElement,
-  parseLastTakenElement,
-  parseChannelState,
   deriveVariant,
   deriveExclusive,
   contentSignature,
 } = require('./parsers');
+const { buildAdapters } = require('./adapters');
 
 const SCHEMA_VERSION = 1;
 
@@ -67,12 +72,8 @@ class Recorder extends EventEmitter {
     this.now = opts.now || (() => new Date().toISOString());
 
     this.seq = 0;
-    this.lastTakenPath = null;
-    this.lastActiveSig = null;
     // elementId -> { templateId, isTemplate, basedOn, content, contentPending, sig, takenAt }
     this.onAir = new Map();
-    this.pendingActorCmds = new Map(); // actor command id -> kind
-    this.actorMsgId = 1;
 
     const outPath = opts.outPath || recordingPath(cfg.outDir, this.now().replace(/:/g, '-'));
     this.writer = opts.writer || new JsonlWriter(outPath);
@@ -80,6 +81,16 @@ class Recorder extends EventEmitter {
 
     this.timers = [];
     this.stopped = false;
+
+    // Build + wire the detection adapters selected by --source. Each adapter
+    // hands the core normalized references via 'take'/'off-air'/'state'; the
+    // core stamps each event with the adapter's `source` tag.
+    this.adapters = buildAdapters(cfg, { cfg, now: this.now, log: this.log });
+    for (const a of this.adapters) {
+      a.on('take', (ref) => { Promise.resolve(this._onTakeSignal(ref, a.source)).catch(() => {}); });
+      a.on('off-air', ({ elementId }) => this._markOffAir(elementId, a.source));
+      a.on('state', (snap) => this._record({ source: a.source, type: 'state', channel: snap.channel, active: snap.active }));
+    }
   }
 
   // ---- event emission ----
@@ -111,6 +122,7 @@ class Recorder extends EventEmitter {
         pilotPort: this.cfg.pilotPort,
         profile: this.cfg.profile,
         channel: this.cfg.channel,
+        source: this.cfg.source,
         stripeTemplateId: this.cfg.stripeTemplateId,
         line1Field: this.cfg.line1Field,
         line2Field: this.cfg.line2Field,
@@ -118,12 +130,21 @@ class Recorder extends EventEmitter {
       },
     });
     this.log(`[recorder] writing ${this.outPath}`);
+    this.log(`[recorder] source=${this.cfg.source} -> adapters: ${this.adapters.map((a) => a.source).join(', ') || '(none)'}`);
     if (!this.cfg.pilotHost) {
       this.log('[recorder] no Pilot host configured -> takes recorded as contentPending:true');
     }
 
-    this._connectActor();
-    this._connectStomp();
+    // Only open the transports the selected adapters actually need.
+    const needActor = this.adapters.some((a) => a.needsActor);
+    const needStomp = this.adapters.some((a) => a.needsStomp);
+    if (needActor) this._connectActor();
+    if (needStomp) this._connectStomp();
+
+    // Change detection: re-fetch on-air Pilot content on its own interval.
+    if (this.cfg.contentPoll) {
+      this.timers.push(setInterval(() => { this._refreshOnAirContent(); }, this.cfg.pollIntervalMs));
+    }
 
     if (this.cfg.durationSec && this.cfg.durationSec > 0) {
       this.timers.push(setTimeout(() => {
@@ -134,28 +155,24 @@ class Recorder extends EventEmitter {
     return this;
   }
 
-  // ---- PepTalk actor leg (take signal) ----
+  // ---- PepTalk actor leg (owned by the core; Director adapter drives it) ----
   _connectActor() {
     const url = `ws://${this.cfg.mseHost}:${this.cfg.actorPort}`;
     this.log(`[recorder] actor connecting ${url}`);
     const ws = new W3CWebSocket(url);
     this.actorWs = ws;
+    const actorAdapters = this.adapters.filter((a) => a.needsActor);
 
     ws.onopen = () => {
       this._record({ source: 'actor', type: 'status', event: 'connected' });
-      this._actorSend('protocol peptalk noevents uri', 'protocol');
-      // Poll state + last_taken_element, and re-check on-air content for changes.
-      const poll = () => {
-        this._actorSend('get /state', 'state');
-        this._actorSend('get /state/last_taken_element', 'last_taken');
-        if (this.cfg.contentPoll) this._refreshOnAirContent();
+      const send = (frame) => {
+        if (this.actorWs && this.actorWs.readyState === this.actorWs.OPEN) this.actorWs.send(frame);
       };
-      poll();
-      this.timers.push(setInterval(poll, this.cfg.pollIntervalMs));
+      for (const a of actorAdapters) if (a.attachActor) a.attachActor(send);
     };
     ws.onmessage = (m) => {
       const data = typeof m.data === 'string' ? m.data : m.data.toString('utf8');
-      this._onActorMessage(data);
+      for (const a of actorAdapters) if (a.handleActorMessage) a.handleActorMessage(data);
     };
     ws.onerror = (e) => {
       this._record({ source: 'actor', type: 'status', event: 'error', message: e && e.message ? e.message : String(e) });
@@ -165,33 +182,7 @@ class Recorder extends EventEmitter {
     };
   }
 
-  _actorSend(cmd, kind) {
-    if (!this.actorWs || this.actorWs.readyState !== this.actorWs.OPEN) return null;
-    const id = this.actorMsgId++;
-    this.pendingActorCmds.set(id, kind);
-    this.actorWs.send(`${id} ${cmd}\r\n`);
-    return id;
-  }
-
-  _onActorMessage(data) {
-    const m = data.match(/^(\d+)\s+(ok|error)\b/);
-    if (!m) return;
-    const id = parseInt(m[1], 10);
-    const status = m[2];
-    const kind = this.pendingActorCmds.get(id);
-    this.pendingActorCmds.delete(id);
-
-    if (kind === 'last_taken') {
-      if (status === 'error') return; // inexistent at home -> no take
-      const ref = parseLastTakenElement(data);
-      if (ref && ref.path && ref.path !== this.lastTakenPath) {
-        this.lastTakenPath = ref.path;
-        if (ref.elementId) this._onTakeSignal(ref, 'actor');
-      }
-    }
-  }
-
-  // ---- STOMP channel-state leg (on-air/off-air) ----
+  // ---- STOMP channel-state leg (owned by the core; Trio adapter drives it) ----
   _connectStomp() {
     const url = `ws://${this.cfg.mseHost}:${this.cfg.stompPort}`;
     this.log(`[recorder] stomp connecting ${url}`);
@@ -204,21 +195,13 @@ class Recorder extends EventEmitter {
       heartbeatOutgoing: 4000,
     });
     this.stompClient = client;
+    const stompAdapters = this.adapters.filter((a) => a.needsStomp);
 
     client.onConnect = () => {
       this._record({ source: 'stomp', type: 'status', event: 'connected' });
-      client.subscribe('/feeds/channelstate', (msg) => {
-        if (msg.body) this._onChannelState(msg.body);
-      });
-      // Optional explicit per-channel subscription when names are known.
-      if (this.cfg.profile) {
-        const pDest = `/state/profile/%2Fconfig%2Fprofiles%2F${encodeURIComponent(this.cfg.profile)}`;
-        client.subscribe(pDest, () => {});
-        if (this.cfg.channel) {
-          const cDest = `/state/channel/%2Fconfig%2Fprofiles%2F${encodeURIComponent(this.cfg.profile)}%2F${encodeURIComponent(this.cfg.channel)}`;
-          client.subscribe(cDest, (msg) => { if (msg.body) this._onChannelState(msg.body); });
-        }
-      }
+      // Adapter-friendly subscribe: hand the body string to the adapter callback.
+      const subscribe = (dest, cb) => client.subscribe(dest, (msg) => cb(msg && msg.body));
+      for (const a of stompAdapters) if (a.attachStomp) a.attachStomp(subscribe);
     };
     client.onStompError = (frame) => {
       this._record({ source: 'stomp', type: 'status', event: 'error', message: frame.headers['message'] });
@@ -229,34 +212,9 @@ class Recorder extends EventEmitter {
     client.activate();
   }
 
-  _onChannelState(body) {
-    const parsed = parseChannelState(body);
-    const activeIds = parsed.active.map((a) => a.elementId);
-    const sig = activeIds.slice().sort().join(',');
+  // ---- take / change / off-air (core — Pilot join + on-air map + de-dupe) ----
 
-    // Record a compact state snapshot only when the active set changes.
-    if (sig !== this.lastActiveSig) {
-      this.lastActiveSig = sig;
-      this._record({
-        source: 'stomp',
-        type: 'state',
-        channel: parsed.channelName,
-        active: parsed.active.map((a) => ({ elementId: a.elementId, templateId: a.templateId, isTemplate: a.isTemplate })),
-      });
-    }
-
-    // New elements entering the active set -> take signal.
-    for (const a of parsed.active) {
-      if (!this.onAir.has(a.elementId)) this._onTakeSignal(a, 'stomp');
-    }
-    // Elements that dropped out -> off-air.
-    const activeSet = new Set(activeIds);
-    for (const id of Array.from(this.onAir.keys())) {
-      if (!activeSet.has(id)) this._markOffAir(id);
-    }
-  }
-
-  // ---- take / change / off-air ----
+  // Called by an adapter's 'take' signal. `source` is the adapter tag.
   async _onTakeSignal(ref, source) {
     if (this.onAir.has(ref.elementId)) return; // already on air; changes via content-poll
     // Reserve the slot synchronously so concurrent signals don't double-fire.
@@ -325,11 +283,15 @@ class Recorder extends EventEmitter {
     }
   }
 
-  _markOffAir(elementId) {
+  // Called by an adapter's 'off-air' signal. The on-air-map check is the
+  // cross-adapter de-dupe: only the FIRST adapter to report a given element
+  // going off air records it (and an element never on air records nothing).
+  _markOffAir(elementId, source) {
+    if (!this.onAir.has(elementId)) return;
     const entry = this.onAir.get(elementId);
     this.onAir.delete(elementId);
     this._record({
-      source: 'stomp',
+      source: source || 'stomp',
       type: 'off-air',
       elementId,
       templateId: entry ? entry.templateId : null,
@@ -363,6 +325,7 @@ class Recorder extends EventEmitter {
     this.stopped = true;
     this.timers.forEach((t) => { clearInterval(t); clearTimeout(t); });
     this.timers = [];
+    for (const a of this.adapters) { try { if (a.stop) a.stop(); } catch (e) { /* ignore */ } }
     this._record({ source: 'recorder', type: 'session', event: 'stop', eventCount: this.writer.count });
     try { if (this.stompClient) this.stompClient.deactivate(); } catch (e) { /* ignore */ }
     try { if (this.actorWs && this.actorWs.readyState === this.actorWs.OPEN) this.actorWs.close(); } catch (e) { /* ignore */ }

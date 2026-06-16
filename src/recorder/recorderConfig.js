@@ -106,6 +106,14 @@ function resolveConfig(argv = process.argv.slice(2), env = process.env, cwd = pr
     profile: pick('profile', 'PROFILE_NAME', null),
     channel: pick('channel', 'CHANNEL_NAME', null),
 
+    // Which detection adapter(s) run: director (actor) | trio (STOMP) | auto
+    // (both). Director is the reliable off-air signal that does NOT depend on
+    // the --channel name; auto lets the on-air map de-dupe overlapping signals.
+    source: (() => {
+      const s = String(pick('source', 'SOURCE', 'auto')).toLowerCase();
+      return ['director', 'trio', 'auto'].includes(s) ? s : 'auto';
+    })(),
+
     // The Stripe identity — overridable, never hard-coded to a value.
     stripeTemplateId: pick('stripe-template', 'TARGET_TEMPLATE_ID', baseConfig.TARGET_TEMPLATE_ID) || null,
 
