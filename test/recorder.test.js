@@ -19,6 +19,8 @@ const {
 } = require('../src/recorder/parsers');
 const { parseJsonl, reconstruct, replayFile, ReplayError } = require('../replay');
 const { Recorder } = require('../src/recorder/recorder');
+const { parseDirectorEvent } = require('../src/recorder/offair');
+const { DirectorAdapter, buildAdapters } = require('../src/recorder/adapters');
 
 // In-memory JSONL writer so we can unit-test the recorder's join logic without
 // touching the filesystem or a live MSE.
@@ -37,6 +39,8 @@ function baseCfg(over = {}) {
 
 const FIX = path.join(__dirname, 'fixtures', 'stripe-lifecycle.jsonl');
 const FIX_TRUNC = path.join(__dirname, 'fixtures', 'stripe-lifecycle.truncated.jsonl');
+const FIX_TAKEOUT_ACTOR = path.join(__dirname, 'fixtures', 'stripe-takeout.actor.json');
+const FIX_TAKEOUT = path.join(__dirname, 'fixtures', 'stripe-takeout.jsonl');
 
 // --- Pilot-join parser: parse(pilotXml) must equal the committed content -----
 
@@ -176,4 +180,116 @@ test('replay accepts a still-on-air element when the session closed cleanly', ()
   const result = reconstruct(events);
   assert.strictEqual(result.stripe.length, 1);
   assert.strictEqual(result.stripe[0].stillOnAir, true);
+});
+
+// --- Stage 2b: Director-stream off-air detection -----------------------------
+
+test('parseDirectorEvent: A=take, O=out, explicit out; element id + line extracted', () => {
+  const a = parseDirectorEvent('* set text /scheduler/x/external/pilotdb/elements/20001/lines/LM-Line_1/state/current A');
+  assert.strictEqual(a.action, 'take');
+  assert.strictEqual(a.elementId, '20001');
+  assert.strictEqual(a.lineNumber, '1');
+
+  const o = parseDirectorEvent('* set text /scheduler/x/external/pilotdb/elements/20001/lines/LM-Line_1/state/current O');
+  assert.strictEqual(o.action, 'out');
+  assert.strictEqual(o.elementId, '20001');
+
+  const oc = parseDirectorEvent('* set text /scheduler/x/lines/LM-Line_2/current out');
+  assert.strictEqual(oc.action, 'out');
+  assert.strictEqual(oc.lineNumber, '2');
+
+  // XML form, and a non-matching message.
+  const xml = parseDirectorEvent('... STATE_<entry name="LM-Line_1"> ... <entry name="state">O</entry> ...');
+  assert.strictEqual(xml.action, 'out');
+  assert.strictEqual(parseDirectorEvent('* set text /foo/bar baz'), null);
+});
+
+test('DirectorAdapter: take via last_taken, then an out with no element id attributes to it', () => {
+  const a = new DirectorAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  const takes = []; const offs = [];
+  a.on('take', (r) => takes.push(r));
+  a.on('off-air', (o) => offs.push(o));
+
+  a.handleActorMessage('* set text /x/last_taken_element {1}<entry name="path">/external/pilotdb/elements/20001</entry>');
+  assert.strictEqual(takes.length, 1);
+  assert.strictEqual(takes[0].elementId, '20001');
+
+  // an O with no element id in the message -> attributed to the active element
+  a.handleActorMessage('* set text /scheduler/x/lines/LM-Line_1/state/current O');
+  assert.strictEqual(offs.length, 1);
+  assert.strictEqual(offs[0].elementId, '20001');
+});
+
+test('DirectorAdapter off-air does NOT depend on the channel name', () => {
+  // The line path carries no channel name at all, yet the out is still detected.
+  const a = new DirectorAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  const offs = [];
+  a.on('off-air', (o) => offs.push(o));
+  a.handleActorMessage('* set text /any/path/external/pilotdb/elements/77/lines/LM-Line_1/state/current O');
+  assert.deepStrictEqual(offs, [{ elementId: '77' }]);
+});
+
+test('--source selects adapters: director only | trio only | auto = both', () => {
+  const director = buildAdapters({ source: 'director' }).map((x) => x.source);
+  const trio = buildAdapters({ source: 'trio' }).map((x) => x.source);
+  const auto = buildAdapters({ source: 'auto' }).map((x) => x.source);
+  assert.deepStrictEqual(director, ['director']);
+  assert.deepStrictEqual(trio, ['trio']);
+  assert.deepStrictEqual(auto, ['director', 'trio']);
+  // unknown -> auto, and the director adapter needs the actor / trio needs stomp
+  assert.deepStrictEqual(buildAdapters({ source: 'bogus' }).map((x) => x.source), ['director', 'trio']);
+});
+
+// The headline Stage-2b proof: feed a take-in -> out actor sequence to a real
+// Recorder (Pilot join stubbed) and assert it PRODUCES a director-sourced
+// off-air, then that replay reconstructs a complete (took -> left) Stripe.
+test('recorder produces an off-air from the director stream; replay reconstructs took→left', async () => {
+  const msgs = JSON.parse(fs.readFileSync(FIX_TAKEOUT_ACTOR, 'utf8'));
+  const writer = memWriter();
+  let t = 0;
+  const now = () => `2026-06-16T19:00:${String(t++).padStart(2, '0')}.000Z`;
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', exclusiveField: '2' }),
+    { writer, logger: () => {}, now });
+  // Stub the Pilot join so the take carries Stripe content (home/test has no Pilot).
+  const stripeContent = { elementId: '20001', templateId: '16082', templateName: 'Stripe',
+    fields: { '0': 'ראש הממשלה נואם', '1': '', '2': '' }, texts: ['ראש הממשלה נואם'] };
+  rec._fetchContent = async () => ({ content: stripeContent, pending: false, error: null, raw: '<xml/>' });
+
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16082', line2Field: '1', source: 'director' } });
+  for (const msg of msgs) {
+    rec.adapters.forEach((a) => { if (a.needsActor) a.handleActorMessage(msg); });
+    await new Promise((r) => setImmediate(r)); // let the async take's Pilot join settle
+  }
+  rec._record({ source: 'recorder', type: 'session', event: 'stop', eventCount: writer.count });
+
+  const take = writer.events.find((e) => e.type === 'take');
+  assert.ok(take, 'a take must be recorded');
+  assert.strictEqual(take.source, 'director');
+  assert.strictEqual(take.elementId, '20001');
+  assert.strictEqual(take.isStripe, true);
+  assert.strictEqual(take.variant, 'ONE_LINE');
+
+  const off = writer.events.find((e) => e.type === 'off-air');
+  assert.ok(off, 'the recorder MUST emit an off-air from the director stream');
+  assert.strictEqual(off.source, 'director');
+  assert.strictEqual(off.elementId, '20001');
+  assert.strictEqual(off.isStripe, true);
+
+  // replay the recorder's own output -> one complete Stripe instance.
+  const result = reconstruct(writer.events);
+  assert.strictEqual(result.stripe.length, 1);
+  const inst = result.stripe[0];
+  assert.ok(inst.tookAt, 'took');
+  assert.ok(inst.leftAt, 'left');
+  assert.strictEqual(inst.stillOnAir, false);
+});
+
+// The committed recorder-output fixture replays to a complete instance too.
+test('committed stripe-takeout.jsonl replays to a complete (took→left) Stripe', () => {
+  const result = replayFile(FIX_TAKEOUT);
+  assert.strictEqual(result.stripe.length, 1);
+  assert.ok(result.stripe[0].leftAt, 'has an off-air / left time');
+  assert.strictEqual(result.stripe[0].stillOnAir, false);
+  assert.strictEqual(result.sessionStopped, true);
 });
