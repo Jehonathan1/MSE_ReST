@@ -516,3 +516,59 @@ test('--source auto records a take/out seen by BOTH director and trio exactly on
   trio.handleChannelState(channelStateXml([]));
   assert.strictEqual(writer.events.filter((e) => e.type === 'off-air').length, 1, 'one off-air, not two');
 });
+
+// === Stage 2d: live-capture regressions (work MSE round 3) ===================
+
+// A second Stripe taking the scheduler line the previous one still holds IS the
+// previous element's off-air — it never emits its own OUT (observed live: 2377832
+// replaced 2377768 on LM-Line_1 with no OUT for 2377768). At this site takes come
+// from the last_taken poll, decoupled from the director 'A' stream, so the core
+// derives the replacement deterministically via single-occupancy. An exclusive
+// (separate template) co-exists with a stripe and must NOT trigger it.
+test('Recorder: a new Stripe take off-airs the previous on-air Stripe (single-occupancy)', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  const tpl = { 20001: '16097', 20002: '16097', 20003: '16092' };
+  rec._fetchContent = async (id) => ({
+    content: { elementId: id, templateId: tpl[id], templateName: 'S', fields: { '0': 'a', '1': 'b' }, texts: ['a', 'b'] },
+    pending: false, error: null, raw: '<x/>',
+  });
+
+  await rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director');
+  assert.strictEqual(writer.events.filter((e) => e.type === 'off-air').length, 0, 'first stripe off-airs nobody');
+
+  await rec._onTakeSignal({ elementId: '20002', templateId: '16097' }, 'director');
+  const offs = writer.events.filter((e) => e.type === 'off-air');
+  assert.strictEqual(offs.length, 1, 'the previous stripe is off-aired');
+  assert.strictEqual(offs[0].elementId, '20001');
+  assert.strictEqual(rec.onAir.has('20001'), false, 'A removed from on-air');
+  assert.strictEqual(rec.onAir.has('20002'), true, 'B is on air');
+
+  // an exclusive (separate template) co-exists — does NOT off-air the stripe
+  await rec._onTakeSignal({ elementId: '20003', templateId: '16092' }, 'director');
+  assert.strictEqual(writer.events.filter((e) => e.type === 'off-air').length, 1, 'exclusive does not off-air the stripe');
+  assert.strictEqual(rec.onAir.has('20002'), true, 'B stays on air alongside the exclusive');
+});
+
+// The content-poll must not race a take's in-flight Pilot fetch and emit a
+// `change` before the `take` (observed live: a change for 2377832 preceded its
+// take). The `taken` guard makes the poll skip a not-yet-recorded element.
+test('content-poll emits no change before the take is recorded (race guard)', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const content = { elementId: '20001', templateId: '16097', templateName: 'S', fields: { '0': 'a', '1': 'b' }, texts: ['a', 'b'] };
+  rec._fetchContent = async () => { await gate; return { content, pending: false, error: null, raw: '<x/>' }; };
+
+  const takeP = rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director');
+  // The take's Pilot fetch is in flight; the slot is reserved but not yet recorded.
+  await rec._refreshOnAirContent();
+  assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 0, 'no change before the take is recorded');
+  release();
+  await takeP;
+  assert.strictEqual(writer.events.filter((e) => e.type === 'take').length, 1, 'the take is recorded exactly once');
+  assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 0, 'and still no spurious change');
+});

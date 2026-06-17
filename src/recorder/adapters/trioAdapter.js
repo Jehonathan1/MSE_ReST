@@ -70,7 +70,11 @@ class TrioAdapter extends EventEmitter {
     if (this.cfg.profile) {
       const enc = encodeURIComponent;
       const profileDest = `/state/profile/%2Fconfig%2Fprofiles%2F${enc(this.cfg.profile)}`;
-      subscribe(profileDest, () => {}); // profile metadata; not needed for set detection
+      // The profile destination carries the channel-state snapshot at some sites
+      // (verified on MSE 5.3.5: the per-channel destination is silent and the
+      // global feed is change-only, but this profile feed delivers the
+      // feed>entry>content[state:channel] frame parseChannelState walks).
+      subscribe(profileDest, (body) => { if (body) this.handleChannelState(body); });
       this.log(`[trio] subscribed profile state: ${profileDest}`);
       if (this.cfg.channel) {
         const channelDest = `/state/channel/%2Fconfig%2Fprofiles%2F${enc(this.cfg.profile)}%2F${enc(this.cfg.channel)}`;

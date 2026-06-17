@@ -227,6 +227,7 @@ class Recorder extends EventEmitter {
       contentPending: true,
       sig: '',
       takenAt: this.now(),
+      taken: false, // the take record is not written until its Pilot fetch resolves
     });
 
     const resolved = await this._fetchContent(ref.elementId);
@@ -237,6 +238,21 @@ class Recorder extends EventEmitter {
     entry.content = resolved.content;
     entry.contentPending = resolved.pending;
     entry.sig = contentSignature(resolved.content);
+    entry.taken = true;
+
+    // Single-occupancy: at this site only one Stripe occupies the scheduler line
+    // (LM-Line_1) at a time, so a NEW stripe take IS the previous stripe's off
+    // air. The replaced element never emits its own OUT here — takes are detected
+    // by the actor's last_taken poll, which is decoupled from the director-stream
+    // 'A' events, so the replacement is invisible at the adapter layer. We derive
+    // it deterministically in the core instead. Scoped to stripe-replaces-stripe:
+    // an exclusive (separate template/layer) co-exists with a stripe.
+    if (this.isStripe(templateId)) {
+      for (const [otherId, otherEntry] of this.onAir) {
+        if (otherId === ref.elementId) continue;
+        if (otherEntry.taken && this.isStripe(otherEntry.templateId)) this._markOffAir(otherId, source);
+      }
+    }
 
     this._record({
       source,
@@ -258,6 +274,10 @@ class Recorder extends EventEmitter {
   async _refreshOnAirContent() {
     if (!this.cfg.pilotHost) return;
     for (const [elementId, entry] of this.onAir) {
+      // Skip elements whose take record hasn't been written yet — the take's own
+      // Pilot fetch establishes the baseline signature. Without this guard the
+      // content-poll races that fetch and emits a spurious change BEFORE the take.
+      if (!entry.taken) continue;
       const resolved = await this._fetchContent(elementId);
       if (!resolved.content) continue;
       const sig = contentSignature(resolved.content);

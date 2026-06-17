@@ -83,7 +83,12 @@ class DirectorAdapter extends EventEmitter {
     // line. The Stage-1 recorder negotiated `noevents`, so it never saw an out.
     // (Official §"Protocol command": noevents = "client does not require events
     // that are not direct results of the client's commands".)
-    this._raw('protocol peptalk events uri');
+    // The protocol command MUST carry a command id like every other PepTalk
+    // command — an id-less line is rejected with `protocol error not implemented
+    // peptalk`, leaving the socket in a non-PepTalk mode where every `get`/
+    // `subscribe` fails (verified on MSE 5.3.5, the work site). Negotiation must
+    // succeed before any get can resolve last_taken.
+    this._cmd('protocol peptalk events uri', 'protocol');
     for (const uri of DIRECTOR_SUBSCRIPTIONS) this._cmd(`subscribe ${uri}`, 'subscribe');
 
     const poll = () => {
@@ -92,10 +97,6 @@ class DirectorAdapter extends EventEmitter {
     };
     poll();
     this.pollTimer = setInterval(poll, this.cfg.pollIntervalMs || 2000);
-  }
-
-  _raw(text) {
-    if (this.send) this.send(`${text}\r\n`);
   }
 
   _cmd(cmd, kind) {
@@ -164,7 +165,11 @@ class DirectorAdapter extends EventEmitter {
 
   // A/O (and delete/replace) from the director stream. 'A' only tracks the active
   // element + its line (take is emitted from last_taken, the proven path); an OUT
-  // resolves its element id then emits the off-air.
+  // resolves its element id then emits the off-air. NOTE: a same-line stripe
+  // replacement (B takes the line A still holds, with no OUT for A) is NOT derived
+  // here — the 'A' stream is decoupled from the last_taken take path at this site,
+  // so it fires unreliably. The core derives that off-air deterministically via
+  // single-occupancy when the new stripe take is recorded (see recorder.js).
   _handleDirectorEvent(ev) {
     if (ev.action === 'take') {
       if (ev.elementId) {
