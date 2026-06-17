@@ -18,6 +18,7 @@ const {
   deriveExclusive,
 } = require('../src/recorder/parsers');
 const { parseJsonl, reconstruct, replayFile, ReplayError } = require('../replay');
+const { buildTimeline, sufficiencyReport, emitFile, pickConcurrentStripe } = require('../timeline');
 const { Recorder } = require('../src/recorder/recorder');
 const { parseDirectorEvent } = require('../src/recorder/offair');
 const { DirectorAdapter, TrioAdapter, buildAdapters } = require('../src/recorder/adapters');
@@ -48,6 +49,16 @@ const FIX_CLEANUP = path.join(__dirname, 'fixtures', 'stripe-cleanup.jsonl');
 const FIX_BYLINE = path.join(__dirname, 'fixtures', 'stripe-byline.jsonl');
 const FIX_DELETE = path.join(__dirname, 'fixtures', 'stripe-delete.jsonl');
 const FIX_TRIO = path.join(__dirname, 'fixtures', 'stripe-trio.jsonl');
+
+// Stage 3: the three REAL Stage-2d captures the sufficiency check is grounded in.
+// The working captures live in the gitignored recordings/ ("office captures live
+// outside git"); these are byte-for-byte mirrors committed under test/fixtures/live
+// so the suite is reproducible on a fresh clone.
+const LIVE = path.join(__dirname, 'fixtures', 'live');
+const CAP_16 = path.join(LIVE, '2026-06-17T09-15-40.203Z.jsonl');           // 16-event end-to-end
+const CAP_16_TIMELINE = path.join(LIVE, '2026-06-17T09-15-40.203Z.timeline.json'); // committed artifact
+const CAP_TRIO = path.join(LIVE, '2026-06-17T09-27-53.322Z.jsonl');         // 4-event Trio-only
+const CAP_DIRECTOR = path.join(LIVE, '2026-06-17T09-04-40.330Z.jsonl');     // 13-event Director
 
 // A channel-state feed body with the given pilot element ids active.
 function channelStateXml(ids) {
@@ -571,4 +582,118 @@ test('content-poll emits no change before the take is recorded (race guard)', as
   await takeP;
   assert.strictEqual(writer.events.filter((e) => e.type === 'take').length, 1, 'the take is recorded exactly once');
   assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 0, 'and still no spurious change');
+});
+
+// === Stage 3: timeline emitter + sufficiency check (grounded in REAL captures) ==
+//
+// The Stage-2d captures must contain everything the Stage-4 bridge needs. These
+// tests assert the normalized bridge contract reconstructs the real captures
+// correctly and that the canonical 16-event capture is SUFFICIENT.
+
+// pickConcurrentStripe: the gate's owner is the most-recently-taken Stripe still
+// on air at the gate's take time (single-owner even when two are "open").
+test('pickConcurrentStripe picks the most-recently-taken on-air Stripe', () => {
+  const stripes = [
+    { elementId: 'A', tookAt: 't1', leftAt: 't9', stillOnAir: false },
+    { elementId: 'B', tookAt: 't3', leftAt: null, stillOnAir: true },
+    { elementId: 'C', tookAt: 't7', leftAt: 't8', stillOnAir: false }, // not yet on air at t5
+  ];
+  assert.strictEqual(pickConcurrentStripe(stripes, 't5').elementId, 'B'); // A & B on air, B newer
+  assert.strictEqual(pickConcurrentStripe(stripes, 't2').elementId, 'A'); // only A on air
+  assert.strictEqual(pickConcurrentStripe([], 't5'), null);              // no stripe → orphan gate
+});
+
+// --- the canonical 16-event capture: 5 TWO_LINE Stripes + one gate window -----
+test('timeline: 16-event capture → 5 TWO_LINE Stripes, one exclusive gate, clean close', () => {
+  const tl = buildTimeline(parseJsonl(fs.readFileSync(CAP_16, 'utf8')));
+  assert.strictEqual(tl.capture.sessionStopped, true, 'session closed cleanly');
+  assert.strictEqual(tl.stripeCount, 5);
+  assert.ok(tl.stripes.every((s) => s.variant === 'TWO_LINE'), 'all 5 Stripes TWO_LINE');
+  assert.ok(tl.stripes.every((s) => s.states.every((st) => st.texts && st.variant)), 'real content, no pending');
+
+  // exactly one gate window, from the co-airing 16092 element, on stripe 2369176.
+  assert.strictEqual(tl.gateWindows.length, 1);
+  const g = tl.gateWindows[0];
+  assert.strictEqual(g.elementId, '2378195');
+  assert.strictEqual(g.templateId, '16092');
+  assert.strictEqual(g.concurrentStripe, '2369176');
+
+  // 16092 is kept OUT of the Stripe instance list.
+  assert.ok(!tl.stripes.some((s) => s.elementId === '2378195'), '16092 not a Stripe instance');
+
+  // the gate folds into 2369176's exclusiveGate as an ON→OFF window.
+  const owner = tl.stripes.find((s) => s.elementId === '2369176');
+  assert.deepStrictEqual(owner.exclusiveGate, [
+    { at: '2026-06-17T09:17:22.738Z', on: true },
+    { at: '2026-06-17T09:17:37.314Z', on: false },
+  ]);
+  // and the gate did NOT off-air its Stripe — 2369176 left AFTER the gate closed.
+  assert.ok(owner.leftAt > g.off, 'exclusive co-exists: stripe off-airs after the gate, not because of it');
+
+  // the last take (2369200) is still on air at the clean stop.
+  const last = tl.stripes[tl.stripes.length - 1];
+  assert.strictEqual(last.elementId, '2369200');
+  assert.strictEqual(last.stillOnAir, true);
+  assert.strictEqual(last.leftAt, null);
+});
+
+// The single-occupancy handover (seq 11 off-air precedes seq 12 take), proving
+// 2369176 emits its OWN OUT — distinct from the exclusive co-airing of seq 9.
+test('timeline: 2369176 off-air (seq 11) precedes the 2377827 take (seq 12), gate is separate', () => {
+  const events = parseJsonl(fs.readFileSync(CAP_16, 'utf8'));
+  const off176 = events.find((e) => e.type === 'off-air' && e.elementId === '2369176');
+  const take827b = events.filter((e) => e.type === 'take' && e.elementId === '2377827')[1]; // 2nd instance
+  assert.ok(off176 && take827b);
+  assert.ok(off176.seq < take827b.seq, 'single-occupancy off-air precedes the next take');
+  assert.ok(off176.ts <= take827b.ts, 'and is not later in time');
+  // the exclusive (seq 9) did NOT off-air 2369176 — its OUT (seq 11) comes later.
+  const take195 = events.find((e) => e.type === 'take' && e.elementId === '2378195');
+  assert.ok(take195.seq < off176.seq, 'exclusive take precedes the stripe OUT — it did not cause it');
+});
+
+// --- Trio-only capture: zero instances, clean close, NO throw -----------------
+test('timeline: Trio-only 4-event capture → zero Stripe instances, clean close, no throw', () => {
+  const tl = buildTimeline(parseJsonl(fs.readFileSync(CAP_TRIO, 'utf8')));
+  assert.strictEqual(tl.stripeCount, 0);
+  assert.deepStrictEqual(tl.stripes, []);
+  assert.deepStrictEqual(tl.gateWindows, []);
+  assert.strictEqual(tl.capture.sessionStopped, true);
+  // and the sufficiency check treats zero-instance-clean-close as a PASS, not a failure.
+  const rep = sufficiencyReport(parseJsonl(fs.readFileSync(CAP_TRIO, 'utf8')));
+  assert.strictEqual(rep.pass, true);
+});
+
+// --- Director 13-event capture: its instances + the gate on the visible stripe -
+test('timeline: Director 13-event capture → 4 TWO_LINE Stripes, gate on the visible stripe', () => {
+  const tl = buildTimeline(parseJsonl(fs.readFileSync(CAP_DIRECTOR, 'utf8')));
+  assert.strictEqual(tl.stripeCount, 4);
+  assert.ok(tl.stripes.every((s) => s.variant === 'TWO_LINE'));
+  // 16092 co-aired while two stripes were "open"; the gate attaches to the
+  // most-recently-taken (visible) one, 2377768 — single owner.
+  assert.strictEqual(tl.gateWindows.length, 1);
+  assert.strictEqual(tl.gateWindows[0].concurrentStripe, '2377768');
+  const owner = tl.stripes.find((s) => s.elementId === '2377768');
+  assert.strictEqual(owner.exclusiveGate.length, 2);
+  assert.strictEqual(owner.exclusiveGate[0].on, true);
+  assert.strictEqual(owner.exclusiveGate[1].on, false);
+});
+
+// --- sufficiency verdict + the declared non-blocking gaps ---------------------
+test('sufficiency: the 16-event capture is SUFFICIENT, with declared non-blocking gaps', () => {
+  const rep = sufficiencyReport(parseJsonl(fs.readFileSync(CAP_16, 'utf8')));
+  assert.strictEqual(rep.pass, true);
+  assert.ok(rep.checks.every((c) => c.ok), 'every blocking check passes');
+  assert.strictEqual(rep.stripeCount, 5);
+  // the two known non-blocking gaps are surfaced, not papered over.
+  const fields = rep.missingFields.map((m) => m.field);
+  assert.ok(fields.some((f) => /exclusiveField/.test(f)), 'exclusive-field gap surfaced');
+  assert.ok(fields.some((f) => /ONE_LINE/.test(f)), 'ONE_LINE-from-live gap surfaced');
+  assert.ok(rep.missingFields.every((m) => m.blocking === false), 'all gaps are non-blocking');
+});
+
+// --- the committed reconstructed-timeline artifact is stable ------------------
+test('the committed 16-event timeline.json equals a fresh re-emit (stable artifact)', () => {
+  const committed = JSON.parse(fs.readFileSync(CAP_16_TIMELINE, 'utf8'));
+  const fresh = emitFile(CAP_16, { sourceLabel: '2026-06-17T09-15-40.203Z.jsonl' });
+  assert.deepStrictEqual(fresh, committed, 'regenerating the emitter must reproduce the committed artifact');
 });
