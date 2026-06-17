@@ -1,0 +1,4 @@
+{"ts":"2026-06-17T09:27:53.325Z","seq":0,"source":"recorder","type":"session","schemaVersion":1,"event":"start","config":{"mseHost":"8.217.127.27","stompPort":8582,"actorPort":8595,"restPort":8580,"pilotHost":"8.217.136.41","pilotPort":8177,"profile":"john","channel":"8.217.127.27","source":"trio","channelStateTimeoutMs":5000,"stripeTemplateId":"16097","line1Field":"1","line2Field":"2","exclusiveField":null}}
+{"ts":"2026-06-17T09:27:53.341Z","seq":1,"source":"stomp","type":"status","event":"connected"}
+{"ts":"2026-06-17T09:27:53.347Z","seq":2,"source":"trio","type":"state","channel":"8.217.127.27","active":[]}
+{"ts":"2026-06-17T09:29:39.594Z","seq":3,"source":"recorder","type":"session","event":"stop","eventCount":3}

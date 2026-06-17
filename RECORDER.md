@@ -149,7 +149,12 @@ node record.js \
 node replay.js recordings/<timestamp>.jsonl
 node replay.js recordings/<timestamp>.jsonl --json     # machine-readable
 
-npm test               # offline regression (fixtures + replay + adapters), 35 tests
+npm test               # offline regression (fixtures + replay + adapters + timeline), 44 tests
+
+# Emit the Stage-4 bridge contract / run the sufficiency check on a capture:
+node timeline.js recordings/<timestamp>.jsonl --report          # sufficiency verdict
+node timeline.js recordings/<timestamp>.jsonl --emit --out out.json   # normalized contract
+# (node replay.js <file> --emit|--report works too). See TIMELINE-SCHEMA.md.
 ```
 
 npm script aliases: `npm run record -- <flags>`, `npm run replay -- <file>`, `npm test`.

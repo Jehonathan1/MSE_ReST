@@ -163,15 +163,31 @@ if (require.main === module) {
     return eq ? eq.split('=')[1] : undefined;
   };
   if (!file) {
-    console.error('usage: node replay.js <file.jsonl> [--stripe-template ID] [--line2-field N] [--json]');
+    console.error('usage: node replay.js <file.jsonl> [--stripe-template ID] [--line2-field N] [--json]'
+      + ' [--emit [--out PATH]] [--report]');
     process.exit(2);
   }
   try {
-    const result = replayFile(file, {
+    const opts = {
       stripeTemplateId: getFlag('stripe-template'),
       line2Field: getFlag('line2-field'),
       exclusiveField: getFlag('exclusive-field'),
-    });
+    };
+    // Stage 3: --emit writes the normalized Stage-4 bridge contract; --report
+    // prints the sufficiency check. Both delegate to timeline.js.
+    if (argv.includes('--emit') || argv.includes('--report')) {
+      const { emitFile, reportFile, formatReport } = require('./timeline');
+      opts.sourceLabel = file.replace(/\\/g, '/').split('/').pop();
+      if (argv.includes('--report')) console.log(formatReport(reportFile(file, opts)));
+      if (argv.includes('--emit')) {
+        const json = JSON.stringify(emitFile(file, opts), null, 2);
+        const out = getFlag('out');
+        if (out) { fs.writeFileSync(out, json + '\n'); console.error(`wrote ${out}`); }
+        else console.log(json);
+      }
+      process.exit(0);
+    }
+    const result = replayFile(file, opts);
     if (argv.includes('--json')) {
       console.log(JSON.stringify(result.stripe.map(summarizeInstance), null, 2));
     } else {

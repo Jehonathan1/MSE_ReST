@@ -77,6 +77,28 @@ key_files: record.js, replay.js, RECORDER.md
   implemented and each has its own fixture (`stripe-cleanup`, `stripe-byline`),
   alongside an official-`delete`-verb fixture (`stripe-delete`). Lesson: a single
   happy-path fixture is not coverage — fixture **per signal**.
+- **(Stage 3) The Stage-2d captures are SUFFICIENT for the Stage-4 bridge —
+  replay is now the formal sufficiency check + a stable timeline contract.**
+  `timeline.js` (`buildTimeline` / `node timeline.js <file> --emit|--report`, also
+  `replay.js --emit|--report`) emits the normalized bridge contract per Stripe
+  instance — `{elementId, templateId, tookAt, leftAt|stillOnAir, variant,
+  states:[{at,variant,texts,fields}], exclusiveGate:[{at,on}]}` — documented in
+  `TIMELINE-SCHEMA.md`. The 16-event end-to-end capture reconstructs to **5
+  TWO_LINE Stripe instances + one exclusive-gate window + clean close**, committed
+  as `test/fixtures/live/2026-06-17T09-15-40.203Z.timeline.json` (the gitignored
+  `recordings/` captures are mirrored byte-for-byte under `test/fixtures/live/` so
+  the artifact + its tests survive a fresh clone). The exclusive Gate is
+  derived from the **co-airing template-16092 element** (take ⇒ gate ON on the
+  concurrent stripe, off-air ⇒ gate OFF), kept OUT of the stripe list and folded
+  into the concurrent stripe — NOT from a 16097 field. The Trio-only 4-event
+  capture correctly reconstructs to **zero instances + clean close** (a PASS, not a
+  failure). **Known non-blocking gaps** (surfaced by `--report`, not papered over):
+  (1) the exclusive-badge Pilot field number is still unidentified, so per-stripe
+  `exclusive` stays `null` — the bridge uses the 16092 gate instead; (2) no live
+  ONE_LINE stripe was captured — variant is derived ("is Line_2 empty?") and
+  unit-proven, not faked; (3) a template-only take would carry `elementId:null` —
+  not a Stripe data element, none in these captures. **Stage-3 issue: CLOSED — the
+  capture is sufficient; the bridge can be built against the committed contract.**
 
 ## Stage-1 deliverable: recorder → JSONL → replay (for viz-to-gsap Stage 3/4)
 
@@ -97,6 +119,7 @@ verifier. The bridge maps: take→In, change→Change, off-air→Out, exclusive�
 
 ## File map
 - `record.js` / `replay.js` — read-only recorder CLI + offline replay/validate harness
+- `timeline.js` / `TIMELINE-SCHEMA.md` — Stage-4 bridge-contract emitter + sufficiency check (`--emit` / `--report`) and its schema doc
 - `src/recorder/` — `recorder.js` (core: connections + join + JSONL), `parsers.js` (shared parse/derive), `offair.js` (official PepTalk five-verb OUT classifier + KB fallbacks), `recorderConfig.js`
 - `src/recorder/adapters/` — detection-adapter interface: `directorAdapter.js` (actor; begin-framing + line-name cross-ref), `trioAdapter.js` (STOMP; channel-state + watchdog), `index.js` (`buildAdapters` by `--source`)
 - `test/` — regression suite + committed Stripe-lifecycle fixtures
