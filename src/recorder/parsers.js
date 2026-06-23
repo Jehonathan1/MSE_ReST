@@ -82,6 +82,84 @@ function parsePilotElement(xmlString, elementId = null) {
   }
 }
 
+// --- MSE element node (<entry name="data"> live working copy) --------------
+
+// Isolate the FIRST `<entry name="data">…</entry>` block, depth-aware so nested
+// `<entry>` subnodes inside it are kept and sibling blocks (schema, viz) are not.
+// Returns the inner XML or null when there is no data entry.
+function extractDataEntry(xml) {
+  if (!xml) return null;
+  const open = xml.match(/<entry\s+name="data"\s*>/);
+  if (!open) return null;
+  const start = open.index + open[0].length;
+  const tokenRe = /<entry\b[^>]*>|<\/entry>/g;
+  tokenRe.lastIndex = start;
+  let depth = 1;
+  let m;
+  while ((m = tokenRe.exec(xml)) !== null) {
+    if (m[0] === '</entry>') {
+      depth -= 1;
+      if (depth === 0) return xml.slice(start, m.index);
+    } else if (!m[0].endsWith('/>')) {
+      depth += 1;
+    }
+  }
+  return xml.slice(start); // unbalanced — return the remainder defensively
+}
+
+// Parse an MSE element-node payload (a PepTalk `get` body) into the SAME content
+// shape as parsePilotElement, sourcing the live on-air values from the element's
+// `<entry name="data">` numeric leaf subnodes.
+//
+// Why: an on-air text edit updates the LIVE MSE document, NOT the saved Pilot DB
+// element (shoot §8.3 — the Pilot element stays byte-identical, same etag). The
+// edited values surface on the element node's data subnodes, exactly as the
+// Media Sequencer document & API §"Live Update Support" describes ("the element
+// data entries (data subnodes) will be filled in with the updated payload field
+// values", l.1009; created-element example l.4830).
+//
+// Field indexing: the 4-layer model's data subnodes are 1-indexed (`<entry
+// name="1">` = first field), while the recorder/Pilot convention is 0-indexed
+// (line1Field=0, line2Field=1). A numeric name N is therefore normalized to N-1
+// (leading zeros tolerated: "01" == "1"), so MSE content is directly comparable
+// to Pilot content and variant-derivable with the same line2Field. Only numeric
+// leaf fields are captured (text leaves) — confirm the exact data-subnode shape /
+// index base on the next live trip (see RECORDER.md; this fix is unconfirmed live).
+function parseMseElementData(xmlString, elementId = null) {
+  const data = {
+    elementId: elementId,
+    templateId: null,
+    templateName: 'MSE Element',
+    fields: {},
+    texts: [],
+  };
+  if (!xmlString) return data;
+
+  try {
+    const tplMatch = xmlString.match(/master_templates\/(\d+)/)
+      || xmlString.match(/\/templates\/(\d+)/)
+      || xmlString.match(/<entry name="template_id">\s*(\d+)\s*<\/entry>/);
+    if (tplMatch) data.templateId = tplMatch[1];
+
+    const block = extractDataEntry(xmlString);
+    if (block != null) {
+      const fieldRe = /<entry name="0*(\d+)"[^>]*>([^<]*)<\/entry>/g;
+      let m;
+      while ((m = fieldRe.exec(block)) !== null) {
+        const idx = Number(m[1]);
+        if (!Number.isFinite(idx) || idx < 1) continue; // 4-layer fields are 1-indexed
+        const name = String(idx - 1); // 1-indexed MSE -> 0-indexed recorder/Pilot
+        const value = decodeEntities(m[2].trim());
+        data.fields[name] = value;
+        if (value) data.texts.push(value);
+      }
+    }
+    return data;
+  } catch (err) {
+    return data;
+  }
+}
+
 // --- Actor /state/last_taken_element ---------------------------------------
 
 // Extract the element reference from a PepTalk actor reply containing
@@ -199,6 +277,8 @@ module.exports = {
   decodeEntities,
   getField,
   parsePilotElement,
+  parseMseElementData,
+  extractDataEntry,
   parseLastTakenElement,
   resolveBasedOn,
   parseChannelState,

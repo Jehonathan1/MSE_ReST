@@ -11,11 +11,13 @@ const path = require('path');
 
 const {
   parsePilotElement,
+  parseMseElementData,
   parseLastTakenElement,
   parseChannelState,
   resolveBasedOn,
   deriveVariant,
   deriveExclusive,
+  contentSignature,
 } = require('../src/recorder/parsers');
 const { parseJsonl, reconstruct, replayFile, ReplayError } = require('../replay');
 const { buildTimeline, sufficiencyReport, emitFile, pickConcurrentStripe } = require('../timeline');
@@ -49,6 +51,8 @@ const FIX_CLEANUP = path.join(__dirname, 'fixtures', 'stripe-cleanup.jsonl');
 const FIX_BYLINE = path.join(__dirname, 'fixtures', 'stripe-byline.jsonl');
 const FIX_DELETE = path.join(__dirname, 'fixtures', 'stripe-delete.jsonl');
 const FIX_TRIO = path.join(__dirname, 'fixtures', 'stripe-trio.jsonl');
+const FIX_RESTRIPE_ACTOR = path.join(__dirname, 'fixtures', 'stripe-restripe.actor.json');
+const FIX_ONAIR_EDIT_MSE = path.join(__dirname, 'fixtures', 'stripe-onair-edit.mse.json');
 
 // Stage 3: the three REAL Stage-2d captures the sufficiency check is grounded in.
 // The working captures live in the gitignored recordings/ ("office captures live
@@ -582,6 +586,180 @@ test('content-poll emits no change before the take is recorded (race guard)', as
   await takeP;
   assert.strictEqual(writer.events.filter((e) => e.type === 'take').length, 1, 'the take is recorded exactly once');
   assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 0, 'and still no spurious change');
+});
+
+// === Fix A (§4.1): same-stripe out→in re-take detected from the line A/O stream ==
+//
+// Shoot §8.6 proved the line A/O event stream (set text …/LM-Line_N/state/current
+// A|O) is RECEIVED and correctly classified as take/out by offair.parseDirectorEvent
+// — the directorAdapter just never EMITTED a take from an 'A' (takes came only from
+// last_taken_element path changes, which freeze on a same-element re-take to the
+// same line). These cases drive the line A/O frames through the recorder's OWN
+// parseDirectorEvent (no hand-rolled parser): on HEAD the re-in emits no take; after
+// the fix it emits exactly one take for the same element, attributed via lineToElement.
+
+test('Fix A: a same-line re-take (ID-less A) re-emits a take via the line map [adapter]', () => {
+  const a = new DirectorAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  const takes = []; const offs = [];
+  a.on('take', (r) => takes.push(r));
+  a.on('off-air', (o) => offs.push(o));
+
+  // first take carries BOTH the element id and its line -> populates lineToElement.
+  a.handleActorMessage('* set text /scheduler/s/external/pilotdb/elements/20001/lines/LM-Line_1/state/current A');
+  assert.strictEqual(takes.length, 1, 'the first line-A emits a take');
+  assert.strictEqual(takes[0].elementId, '20001');
+
+  // out on the same line (element=? — ID-less, as the live re-take frames are).
+  a.handleActorMessage('* set text /scheduler/s/show/lines/LM-Line_1/state/current O');
+  assert.deepStrictEqual(offs, [{ elementId: '20001' }]);
+
+  // re-take to the SAME line, still ID-less: resolves to 20001 via lineToElement,
+  // which must survive the out — last_taken is frozen so this is the only signal.
+  a.handleActorMessage('* set text /scheduler/s/show/lines/LM-Line_1/state/current A');
+  assert.strictEqual(takes.length, 2, 'the same-line re-take re-emits a take (was the §4.1 blind spot)');
+  assert.strictEqual(takes[1].elementId, '20001');
+});
+
+test('Fix A: same-stripe out→in fixture → second take recorded; replay took→left + re-take', async () => {
+  const events = await runDirectorFixture(FIX_RESTRIPE_ACTOR);
+  const takes = events.filter((e) => e.type === 'take');
+  // HEAD records ONLY the first take (the re-in is invisible: no last_taken delta,
+  // no take emitted from the line-A). The fix records the re-in as a 2nd take.
+  assert.strictEqual(takes.length, 2, 'the same-stripe re-take is detected as a second take');
+  assert.ok(takes.every((t) => t.elementId === '20001'), 'both takes are element 20001');
+  assert.ok(takes.every((t) => t.source === 'director' && t.isStripe), 'director Stripe takes');
+
+  const offs = events.filter((e) => e.type === 'off-air');
+  assert.strictEqual(offs.length, 1, 'exactly one off-air between the two takes (the out)');
+  assert.strictEqual(offs[0].elementId, '20001');
+
+  // replay: first instance complete (took→left); the re-take is still on air at the
+  // clean session stop.
+  const r = reconstruct(events).stripe;
+  assert.strictEqual(r.length, 2, 'two Stripe instances of the same element');
+  assert.ok(r[0].tookAt && r[0].leftAt && !r[0].stillOnAir, 'first instance took→left');
+  assert.ok(r[1].tookAt && r[1].stillOnAir, 'second (re-take) instance still on air at stop');
+});
+
+test('Fix A regression: a distinct-element take fires once when BOTH last_taken and line-A arrive', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', stripeTemplateId: '16082' }),
+    { writer, logger: () => {}, now: () => 't' });
+  rec._fetchContent = async (id) => ({
+    content: { elementId: id, templateId: '16082', templateName: 'S', fields: { '0': 'a', '1': '' }, texts: ['a'] },
+    pending: false, error: null, raw: '<x/>',
+  });
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16082', line2Field: '1', source: 'director' } });
+  const d = rec.adapters.find((a) => a.source === 'director');
+
+  // Both signals for the SAME fresh element: the line-A (with id) AND the last_taken
+  // delta. The core's on-air map must de-dupe to exactly one take.
+  d.handleActorMessage('* set text /scheduler/s/external/pilotdb/elements/30001/lines/LM-Line_1/state/current A');
+  await new Promise((r) => setImmediate(r));
+  d.handleActorMessage('* set text /state/last_taken_element {1}<entry name="path">/external/pilotdb/elements/30001</entry>');
+  await new Promise((r) => setImmediate(r));
+
+  const takes = writer.events.filter((e) => e.type === 'take');
+  assert.strictEqual(takes.length, 1, 'no double-emit: distinct-element take fires exactly once');
+  assert.strictEqual(takes[0].elementId, '30001');
+});
+
+// === Fix B (§8.3): on-air edit sourced from the MSE element data subnodes =====
+//
+// An on-air text edit updates the LIVE MSE document, not the saved Pilot DB
+// element (proven byte-identical + same etag, shoot §8.3). The content-poll only
+// re-read Pilot, so it never saw the edit. The edited values live on the element
+// node's <entry name="data"> subnodes (shoot §8.5 / API §"Live Update Support");
+// the fix sources on-air content from there via PepTalk and emits a `change` when
+// that signature moves.
+
+test('parseMseElementData parses <entry name="data"> leaves into 0-indexed content (skips decoys)', () => {
+  const fix = JSON.parse(fs.readFileSync(FIX_ONAIR_EDIT_MSE, 'utf8'));
+  const before = parseMseElementData(fix.before, '2380782');
+  assert.strictEqual(before.elementId, '2380782');
+  assert.strictEqual(before.templateId, '16097');
+  // 4-layer MSE data is 1-indexed -> normalized to the recorder's 0-indexed fields;
+  // the <entry name="data"> isolation drops the schema decoy (name="5").
+  assert.deepStrictEqual(before.fields, { '0': 'דרעי מצטרף לקריאה לפיזור הכנסת', '1': 'יו"ר ש"ס מצטרף' });
+  assert.deepStrictEqual(before.texts, ['דרעי מצטרף לקריאה לפיזור הכנסת', 'יו"ר ש"ס מצטרף']);
+  assert.strictEqual(deriveVariant(before, '1'), 'TWO_LINE'); // Line_2 (field '1') populated
+
+  const after = parseMseElementData(fix.after, '2380782');
+  assert.strictEqual(after.fields['0'], 'ועכשיו כתוב פה משהו אחר לגמרי!');
+  assert.notStrictEqual(contentSignature(before), contentSignature(after), 'an on-air edit moves the signature');
+});
+
+test('Fix B: on-air edit (MSE data changed, Pilot unchanged) emits exactly one mse change', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  // Pilot stays byte-identical the whole test — the saved DB element an on-air edit
+  // never touches (shoot §8.3).
+  const pilot = { elementId: '20001', templateId: '16097', templateName: 'S',
+    fields: { '0': 'orig line 1', '1': 'orig line 2' }, texts: ['orig line 1', 'orig line 2'] };
+  rec._fetchContent = async () => ({ content: pilot, pending: false, error: null, raw: '<x/>' });
+  // MSE live content starts equal to Pilot, then the operator edits Line_1 on air.
+  let mse = { elementId: '20001', templateId: '16097', templateName: 'MSE Element',
+    fields: { '0': 'orig line 1', '1': 'orig line 2' }, texts: ['orig line 1', 'orig line 2'] };
+  rec._fetchMseElementData = async () => ({ content: mse });
+
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+  await rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director');
+  assert.strictEqual(writer.events.filter((e) => e.type === 'take').length, 1, 'one take recorded');
+
+  // poll #1 — establishes the live MSE baseline; no change.
+  await rec._refreshOnAirContent();
+  assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 0, 'baseline read emits no change');
+
+  // operator edits Line_1 ON AIR — only the MSE document changes; Pilot untouched.
+  mse = { elementId: '20001', templateId: '16097', templateName: 'MSE Element',
+    fields: { '0': 'EDITED on air', '1': 'orig line 2' }, texts: ['EDITED on air', 'orig line 2'] };
+  await rec._refreshOnAirContent();
+  const changes = writer.events.filter((e) => e.type === 'change');
+  assert.strictEqual(changes.length, 1, 'the on-air edit emits exactly one change');
+  assert.strictEqual(changes[0].source, 'mse', 'change is MSE-sourced, not Pilot');
+  assert.strictEqual(changes[0].elementId, '20001');
+  assert.deepStrictEqual(changes[0].content.texts, ['EDITED on air', 'orig line 2'], 'change carries the edited line');
+
+  // poll again with identical MSE content — no spurious change (signature match).
+  await rec._refreshOnAirContent();
+  assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 1, 'no spurious change when MSE content is identical');
+});
+
+test('Fix B: a missing/transient live MSE node is tolerated (no change, no throw)', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  const pilot = { elementId: '20001', templateId: '16097', templateName: 'S',
+    fields: { '0': 'a', '1': 'b' }, texts: ['a', 'b'] };
+  rec._fetchContent = async () => ({ content: pilot, pending: false, error: null, raw: '<x/>' });
+  rec._fetchMseElementData = async () => ({ content: null }); // /data/VCP/... transient/absent
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+  await rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director');
+  await rec._refreshOnAirContent();
+  await rec._refreshOnAirContent();
+  assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 0, 'absent live node => no change');
+});
+
+test('DirectorAdapter.getNode issues a read-only get and resolves its payload (null on inexistent)', async () => {
+  const sent = [];
+  const a = new DirectorAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  a.attachActor((frame) => sent.push(frame));
+  const p = a.getNode('/external/pilotdb/elements/20001');
+  const getFrame = sent.find((f) => /\bget \/external\/pilotdb\/elements\/20001\b/.test(f));
+  assert.ok(getFrame, 'getNode issues a read-only `get`');
+  const id = getFrame.match(/^(\d+)\s/)[1];
+  a.handleActorMessage(`${id} ok {12}<element/>`);
+  assert.ok(/<element\/>/.test(await p), 'resolves the get payload');
+
+  const p2 = a.getNode('/data/VCP/none');
+  const id2 = sent[sent.length - 1].match(/^(\d+)\s/)[1];
+  a.handleActorMessage(`${id2} error inexistent /data/VCP/none`);
+  assert.strictEqual(await p2, null, 'an inexistent node resolves null (tolerated)');
+  a.stop();
 });
 
 // === Stage 3: timeline emitter + sufficiency check (grounded in REAL captures) ==

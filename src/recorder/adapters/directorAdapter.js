@@ -67,6 +67,7 @@ class DirectorAdapter extends EventEmitter {
     this.send = null;
     this.msgId = 1;
     this.pending = new Map();           // actor command id -> kind
+    this.getRequests = new Map();       // our `getNode` command id -> Promise resolver
     this.ownBegin = new Set();          // our command ids inside a begin..ok window
     this.lastTakenPath = null;          // de-dupe repeat last_taken polls
     this.currentActiveElementId = null; // single-active tracking, for attribution
@@ -107,6 +108,28 @@ class DirectorAdapter extends EventEmitter {
     return id;
   }
 
+  // Read-only point `get` of a single node, used by the core's on-air content-poll
+  // to read live MSE element data (`<entry name="data">`) for §8.3 on-air edits.
+  // Resolves with the raw response frame (`<id> ok {len}<xml>`), or null on error /
+  // inexistent / timeout / no socket. Strictly `get` — no mutating verb.
+  getNode(path) {
+    if (!this.send) return Promise.resolve(null);
+    const id = this.msgId++;
+    this.pending.set(id, 'getnode');
+    return new Promise((resolve) => {
+      this.getRequests.set(id, resolve);
+      this.send(`${id} get ${path}\r\n`);
+      const timeout = (this.cfg && this.cfg.pilotTimeoutMs) || 5000;
+      setTimeout(() => {
+        if (this.getRequests.has(id)) {
+          this.getRequests.delete(id);
+          this.pending.delete(id);
+          resolve(null); // no reply — tolerated (transient/absent node)
+        }
+      }, timeout);
+    });
+  }
+
   // ---- inbound actor frames ----
   handleActorMessage(data) {
     if (!data) return;
@@ -130,6 +153,12 @@ class DirectorAdapter extends EventEmitter {
       const kind = this.pending.get(id);
       this.pending.delete(id);
       this.ownBegin.delete(id);
+      if (kind === 'getnode') {
+        const resolve = this.getRequests.get(id);
+        this.getRequests.delete(id);
+        if (resolve) resolve(status === 'ok' ? data : null);
+        return;
+      }
       if (kind === 'last_taken' && status === 'ok') this._handleLastTaken(data);
       return;
     }
@@ -163,18 +192,47 @@ class DirectorAdapter extends EventEmitter {
     });
   }
 
-  // A/O (and delete/replace) from the director stream. 'A' only tracks the active
-  // element + its line (take is emitted from last_taken, the proven path); an OUT
-  // resolves its element id then emits the off-air. NOTE: a same-line stripe
-  // replacement (B takes the line A still holds, with no OUT for A) is NOT derived
-  // here — the 'A' stream is decoupled from the last_taken take path at this site,
-  // so it fires unreliably. The core derives that off-air deterministically via
-  // single-occupancy when the new stripe take is recorded (see recorder.js).
+  // A/O (and delete/replace) from the director stream — the take/out signal for a
+  // same-line re-take, which last_taken cannot see.
+  //
+  // Fix §4.1 (shoot §8.6): a same-element re-take to the SAME line produces an 'A'
+  // on the line but NO last_taken_element path change (last_taken stays frozen on
+  // the prior take), so the proven _handleLastTaken path emits nothing. The 'A'
+  // event IS received and classified as a take here — so we emit a take from it
+  // too. The core's on-air map de-dupes the overlap with _handleLastTaken (a
+  // distinct-element take arrives on both paths but is recorded once), so this is
+  // additive: it only adds the takes last_taken misses.
+  //
+  // Attribution: the live line A/O frames carry element=? (no Pilot id), so a
+  // re-take's 'A' is resolved through lineToElement (populated by the FIRST take,
+  // which named both id and line) and then the current active element. For that to
+  // work across an out→in cycle, an OUT must NOT forget its line→element mapping —
+  // the line is the same element when it comes back. (A genuinely different element
+  // taking the line overwrites the mapping on its own first take.)
   _handleDirectorEvent(ev) {
     if (ev.action === 'take') {
+      // Resolve the element id, in order: the id named in the event, else the
+      // on-air line map, else the current active element.
+      let elementId = ev.elementId;
+      if (!elementId && ev.lineName && this.lineToElement.has(ev.lineName)) {
+        elementId = this.lineToElement.get(ev.lineName);
+      }
+      if (!elementId) elementId = this.currentActiveElementId;
+
       if (ev.elementId) {
         this.currentActiveElementId = ev.elementId;
         if (ev.lineName) this.lineToElement.set(ev.lineName, ev.elementId); // on-air line map
+      } else if (elementId) {
+        this.currentActiveElementId = elementId; // restore active id on an ID-less re-take
+      }
+
+      if (elementId) {
+        this.emit('take', {
+          elementId,
+          templateId: ev.templateId || null,
+          isTemplate: false,
+          basedOn: null,
+        });
       }
       return;
     }
@@ -196,7 +254,9 @@ class DirectorAdapter extends EventEmitter {
       return;
     }
     this.log(`[director] OFF-AIR signal (${ev.rule}/${ev.verb || 'heuristic'}) element ${elementId} via ${how} (line ${ev.lineName || '?'})`);
-    if (ev.lineName) this.lineToElement.delete(ev.lineName);
+    // Keep lineToElement[lineName] across the out: the same line coming back 'A'
+    // (a same-stripe re-take, §4.1) must still resolve to this element. A different
+    // element taking the line overwrites the mapping on its own first take.
     if (elementId === this.currentActiveElementId) this.currentActiveElementId = null;
     this.emit('off-air', { elementId });
   }

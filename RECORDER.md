@@ -29,7 +29,7 @@ writer; **adapters only DETECT** and hand normalized references to the core.
 
 | Adapter | Transport | Detects | `source` tag |
 |---|---|---|---|
-| **Director** | PepTalk **actor** (8595) | take (`last_taken_element`) **+ take-out / off-air** (director stream `A`/`O`) | `director` |
+| **Director** | PepTalk **actor** (8595) | take (`last_taken_element` **+ line state `A`**, §4.1) **+ take-out / off-air** (director stream `A`/`O`) | `director` |
 | **Trio** | **STOMP** channel-state (8582) | take + off-air + active-set `state` snapshots | `trio` |
 
 Each adapter emits the recorder's normalized events — `take` / `off-air` (Trio
@@ -107,6 +107,52 @@ it resolved (`[director] OFF-AIR signal (rule/verb) element … via id|line-name
 Subscriptions: `/scheduler` (covers its subtree),
 `/scheduler/*/state/current`, `/scheduler/*/element/*/lines/LM-Line_*/state/current`,
 `/state/system/log`, `/state/playout`.
+
+### Take detection — `last_taken` **plus** the line 'A' event (§4.1 fix)
+
+Takes are detected from **two** signals, de-duped by the core's on-air map:
+
+1. **`last_taken_element` path change** (`_handleLastTaken`) — the proven Stage-1
+   path. Reliable for **distinct-element** takes (different element ⇒ path changes).
+2. **Line state→'A'** (`_handleDirectorEvent`) — emits a take from the same
+   `/scheduler/*/…/LM-Line_*/state/current A` event the OUT detection already uses.
+
+**Why #2 exists (shoot §4.1/§8.5/§8.6):** a same-element re-take to the **same line**
+(out → in of one stripe) produces **no `last_taken` path change** — `last_taken` stays
+frozen on the prior take — so #1 alone misses the re-in (and any on-air re-take/hot-swap
+on the still-live element). The line 'A' event *is* received and classified as a take by
+`offair.parseDirectorEvent`; the adapter now **emits** from it. Live line frames carry
+`element=?` (no Pilot id), so the 'A' is attributed via the `lineToElement` map (the
+first take populates it with id+line) → fallback the current active element. The OUT no
+longer deletes its line→element mapping, so the same line returning 'A' resolves back to
+the same element. The core's on-air map (`if (onAir.has(id)) return`) de-dupes the overlap,
+so a distinct-element take seen on **both** #1 and #2 is still recorded **once**.
+
+### On-air content — Pilot DB **plus** the live MSE element data (§8.3 fix)
+
+A `change` while an element stays on air now comes from **two** sources:
+
+- **Pilot REST** (`_refreshPilotContent`, `source:'pilot'`) — re-`GET /dataelements/<id>`;
+  catches edits that **write back to the saved DB element**.
+- **Live MSE element data** (`_refreshMseContent`, `source:'mse'`) — reads the element
+  node's `<entry name="data">` subnodes over **PepTalk** on the actor socket (`:8595`),
+  via `directorAdapter.getNode` (read-only `get`) + `parsers.parseMseElementData`.
+
+**Why the MSE source exists (shoot §8.3/§8.5):** an **on-air text edit** updates the live
+MSE/engine instance but does **not** write back to the Pilot element (proven byte-identical
++ same etag — *not* a cache artifact). The Pilot-only poll read the wrong copy and emitted
+no change. The edited values live on the MSE element node's `<entry name="data">` subnodes
+(*Media Sequencer document & API* §"Live Update Support"). A **separate `mseSig` baseline**
+(MSE-vs-MSE, robust to Pilot/MSE field-shape differences) establishes on the first read and
+emits one `change` when the live signature moves; an absent/transient live node
+(`/data/VCP/…` when nothing is taken) is tolerated. 4-layer data subnodes are 1-indexed,
+normalized to the recorder's 0-indexed convention.
+
+> **Both fixes are reproduce-first proven offline but UNCONFIRMED LIVE.** The local rig has
+> no live takes/content, so the frozen-`last_taken` behavior, the `<entry name="data">`
+> shape / index base, and the live `get` path must be confirmed on the next on-site trip.
+> §4.1 (same-stripe out/in) and §8.3 (on-air edit) are **two separate signals** (shoot §8.5):
+> the line 'A' event fixes the first, the MSE data node fixes the second — neither fixes both.
 
 ### Trio off-air detection — STOMP channel-state (off-air by absence)
 
@@ -196,8 +242,10 @@ One JSON object per line. Common fields: `ts` (wall-clock ISO-8601), `seq`
 (monotonic), `source`, `type`. The first line is always a `session` header
 carrying the full config (now including `source`), so the file is self-sufficient
 for offline replay. `source` is the **transport** on connection events
-(`recorder` | `actor` | `stomp`) and the **detection adapter** on the normalized
-events (`director` | `trio` | `pilot`).
+(`recorder` | `actor` | `stomp`) and the **detection adapter / content source** on
+the normalized events (`director` | `trio` | `pilot` | `mse`). A `change` is
+`pilot`-sourced when the saved Pilot DB element changed, or `mse`-sourced when the
+**live MSE element data** changed (an on-air edit — §8.3 fix below).
 
 | `type` | source | Key fields |
 |---|---|---|
@@ -205,7 +253,7 @@ events (`director` | `trio` | `pilot`).
 | `status` | actor / stomp | `event` (`connected`\|`closed`\|`error`), `message?` |
 | `state` | trio | `channel`, `active[]` (`{elementId, templateId, isTemplate}`) — emitted only when the active set changes |
 | `take` | director / trio | `elementId`, `templateId`, `isTemplate`, `basedOn`, `isStripe`, `content`, `contentPending`, `contentError`, `variant`, `exclusive`, `pilotXml?` |
-| `change` | pilot | same content fields as `take` — emitted when an on-air element's Pilot content changes (Line edit / exclusive toggle) |
+| `change` | pilot / mse | same content fields as `take` — emitted when an on-air element's content changes: `pilot` = the saved Pilot DB element changed; `mse` = the **live MSE element data** changed (an on-air edit, §8.3) |
 | `off-air` | director / trio | `elementId`, `templateId`, `isStripe` |
 
 `content` (when resolved) is `{ elementId, templateId, templateName, fields{}, texts[] }`,
