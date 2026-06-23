@@ -67,6 +67,7 @@ class DirectorAdapter extends EventEmitter {
     this.send = null;
     this.msgId = 1;
     this.pending = new Map();           // actor command id -> kind
+    this.getRequests = new Map();       // our `getNode` command id -> Promise resolver
     this.ownBegin = new Set();          // our command ids inside a begin..ok window
     this.lastTakenPath = null;          // de-dupe repeat last_taken polls
     this.currentActiveElementId = null; // single-active tracking, for attribution
@@ -107,6 +108,28 @@ class DirectorAdapter extends EventEmitter {
     return id;
   }
 
+  // Read-only point `get` of a single node, used by the core's on-air content-poll
+  // to read live MSE element data (`<entry name="data">`) for §8.3 on-air edits.
+  // Resolves with the raw response frame (`<id> ok {len}<xml>`), or null on error /
+  // inexistent / timeout / no socket. Strictly `get` — no mutating verb.
+  getNode(path) {
+    if (!this.send) return Promise.resolve(null);
+    const id = this.msgId++;
+    this.pending.set(id, 'getnode');
+    return new Promise((resolve) => {
+      this.getRequests.set(id, resolve);
+      this.send(`${id} get ${path}\r\n`);
+      const timeout = (this.cfg && this.cfg.pilotTimeoutMs) || 5000;
+      setTimeout(() => {
+        if (this.getRequests.has(id)) {
+          this.getRequests.delete(id);
+          this.pending.delete(id);
+          resolve(null); // no reply — tolerated (transient/absent node)
+        }
+      }, timeout);
+    });
+  }
+
   // ---- inbound actor frames ----
   handleActorMessage(data) {
     if (!data) return;
@@ -130,6 +153,12 @@ class DirectorAdapter extends EventEmitter {
       const kind = this.pending.get(id);
       this.pending.delete(id);
       this.ownBegin.delete(id);
+      if (kind === 'getnode') {
+        const resolve = this.getRequests.get(id);
+        this.getRequests.delete(id);
+        if (resolve) resolve(status === 'ok' ? data : null);
+        return;
+      }
       if (kind === 'last_taken' && status === 'ok') this._handleLastTaken(data);
       return;
     }

@@ -11,11 +11,13 @@ const path = require('path');
 
 const {
   parsePilotElement,
+  parseMseElementData,
   parseLastTakenElement,
   parseChannelState,
   resolveBasedOn,
   deriveVariant,
   deriveExclusive,
+  contentSignature,
 } = require('../src/recorder/parsers');
 const { parseJsonl, reconstruct, replayFile, ReplayError } = require('../replay');
 const { buildTimeline, sufficiencyReport, emitFile, pickConcurrentStripe } = require('../timeline');
@@ -50,6 +52,7 @@ const FIX_BYLINE = path.join(__dirname, 'fixtures', 'stripe-byline.jsonl');
 const FIX_DELETE = path.join(__dirname, 'fixtures', 'stripe-delete.jsonl');
 const FIX_TRIO = path.join(__dirname, 'fixtures', 'stripe-trio.jsonl');
 const FIX_RESTRIPE_ACTOR = path.join(__dirname, 'fixtures', 'stripe-restripe.actor.json');
+const FIX_ONAIR_EDIT_MSE = path.join(__dirname, 'fixtures', 'stripe-onair-edit.mse.json');
 
 // Stage 3: the three REAL Stage-2d captures the sufficiency check is grounded in.
 // The working captures live in the gitignored recordings/ ("office captures live
@@ -660,6 +663,103 @@ test('Fix A regression: a distinct-element take fires once when BOTH last_taken 
   const takes = writer.events.filter((e) => e.type === 'take');
   assert.strictEqual(takes.length, 1, 'no double-emit: distinct-element take fires exactly once');
   assert.strictEqual(takes[0].elementId, '30001');
+});
+
+// === Fix B (§8.3): on-air edit sourced from the MSE element data subnodes =====
+//
+// An on-air text edit updates the LIVE MSE document, not the saved Pilot DB
+// element (proven byte-identical + same etag, shoot §8.3). The content-poll only
+// re-read Pilot, so it never saw the edit. The edited values live on the element
+// node's <entry name="data"> subnodes (shoot §8.5 / API §"Live Update Support");
+// the fix sources on-air content from there via PepTalk and emits a `change` when
+// that signature moves.
+
+test('parseMseElementData parses <entry name="data"> leaves into 0-indexed content (skips decoys)', () => {
+  const fix = JSON.parse(fs.readFileSync(FIX_ONAIR_EDIT_MSE, 'utf8'));
+  const before = parseMseElementData(fix.before, '2380782');
+  assert.strictEqual(before.elementId, '2380782');
+  assert.strictEqual(before.templateId, '16097');
+  // 4-layer MSE data is 1-indexed -> normalized to the recorder's 0-indexed fields;
+  // the <entry name="data"> isolation drops the schema decoy (name="5").
+  assert.deepStrictEqual(before.fields, { '0': 'דרעי מצטרף לקריאה לפיזור הכנסת', '1': 'יו"ר ש"ס מצטרף' });
+  assert.deepStrictEqual(before.texts, ['דרעי מצטרף לקריאה לפיזור הכנסת', 'יו"ר ש"ס מצטרף']);
+  assert.strictEqual(deriveVariant(before, '1'), 'TWO_LINE'); // Line_2 (field '1') populated
+
+  const after = parseMseElementData(fix.after, '2380782');
+  assert.strictEqual(after.fields['0'], 'ועכשיו כתוב פה משהו אחר לגמרי!');
+  assert.notStrictEqual(contentSignature(before), contentSignature(after), 'an on-air edit moves the signature');
+});
+
+test('Fix B: on-air edit (MSE data changed, Pilot unchanged) emits exactly one mse change', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  // Pilot stays byte-identical the whole test — the saved DB element an on-air edit
+  // never touches (shoot §8.3).
+  const pilot = { elementId: '20001', templateId: '16097', templateName: 'S',
+    fields: { '0': 'orig line 1', '1': 'orig line 2' }, texts: ['orig line 1', 'orig line 2'] };
+  rec._fetchContent = async () => ({ content: pilot, pending: false, error: null, raw: '<x/>' });
+  // MSE live content starts equal to Pilot, then the operator edits Line_1 on air.
+  let mse = { elementId: '20001', templateId: '16097', templateName: 'MSE Element',
+    fields: { '0': 'orig line 1', '1': 'orig line 2' }, texts: ['orig line 1', 'orig line 2'] };
+  rec._fetchMseElementData = async () => ({ content: mse });
+
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+  await rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director');
+  assert.strictEqual(writer.events.filter((e) => e.type === 'take').length, 1, 'one take recorded');
+
+  // poll #1 — establishes the live MSE baseline; no change.
+  await rec._refreshOnAirContent();
+  assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 0, 'baseline read emits no change');
+
+  // operator edits Line_1 ON AIR — only the MSE document changes; Pilot untouched.
+  mse = { elementId: '20001', templateId: '16097', templateName: 'MSE Element',
+    fields: { '0': 'EDITED on air', '1': 'orig line 2' }, texts: ['EDITED on air', 'orig line 2'] };
+  await rec._refreshOnAirContent();
+  const changes = writer.events.filter((e) => e.type === 'change');
+  assert.strictEqual(changes.length, 1, 'the on-air edit emits exactly one change');
+  assert.strictEqual(changes[0].source, 'mse', 'change is MSE-sourced, not Pilot');
+  assert.strictEqual(changes[0].elementId, '20001');
+  assert.deepStrictEqual(changes[0].content.texts, ['EDITED on air', 'orig line 2'], 'change carries the edited line');
+
+  // poll again with identical MSE content — no spurious change (signature match).
+  await rec._refreshOnAirContent();
+  assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 1, 'no spurious change when MSE content is identical');
+});
+
+test('Fix B: a missing/transient live MSE node is tolerated (no change, no throw)', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  const pilot = { elementId: '20001', templateId: '16097', templateName: 'S',
+    fields: { '0': 'a', '1': 'b' }, texts: ['a', 'b'] };
+  rec._fetchContent = async () => ({ content: pilot, pending: false, error: null, raw: '<x/>' });
+  rec._fetchMseElementData = async () => ({ content: null }); // /data/VCP/... transient/absent
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+  await rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director');
+  await rec._refreshOnAirContent();
+  await rec._refreshOnAirContent();
+  assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 0, 'absent live node => no change');
+});
+
+test('DirectorAdapter.getNode issues a read-only get and resolves its payload (null on inexistent)', async () => {
+  const sent = [];
+  const a = new DirectorAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  a.attachActor((frame) => sent.push(frame));
+  const p = a.getNode('/external/pilotdb/elements/20001');
+  const getFrame = sent.find((f) => /\bget \/external\/pilotdb\/elements\/20001\b/.test(f));
+  assert.ok(getFrame, 'getNode issues a read-only `get`');
+  const id = getFrame.match(/^(\d+)\s/)[1];
+  a.handleActorMessage(`${id} ok {12}<element/>`);
+  assert.ok(/<element\/>/.test(await p), 'resolves the get payload');
+
+  const p2 = a.getNode('/data/VCP/none');
+  const id2 = sent[sent.length - 1].match(/^(\d+)\s/)[1];
+  a.handleActorMessage(`${id2} error inexistent /data/VCP/none`);
+  assert.strictEqual(await p2, null, 'an inexistent node resolves null (tolerated)');
+  a.stop();
 });
 
 // === Stage 3: timeline emitter + sufficiency check (grounded in REAL captures) ==

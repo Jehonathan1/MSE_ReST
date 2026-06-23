@@ -29,6 +29,7 @@ const W3CWebSocket = require('websocket').w3cwebsocket;
 
 const {
   parsePilotElement,
+  parseMseElementData,
   deriveVariant,
   deriveExclusive,
   contentSignature,
@@ -226,6 +227,7 @@ class Recorder extends EventEmitter {
       content: null,
       contentPending: true,
       sig: '',
+      mseSig: null, // live MSE-data baseline (§8.3), set on the first successful read
       takenAt: this.now(),
       taken: false, // the take record is not written until its Pilot fetch resolves
     });
@@ -272,36 +274,97 @@ class Recorder extends EventEmitter {
   }
 
   async _refreshOnAirContent() {
-    if (!this.cfg.pilotHost) return;
     for (const [elementId, entry] of this.onAir) {
       // Skip elements whose take record hasn't been written yet — the take's own
       // Pilot fetch establishes the baseline signature. Without this guard the
       // content-poll races that fetch and emits a spurious change BEFORE the take.
       if (!entry.taken) continue;
-      const resolved = await this._fetchContent(elementId);
-      if (!resolved.content) continue;
-      const sig = contentSignature(resolved.content);
-      if (sig === entry.sig) continue; // no change
-      const cur = this.onAir.get(elementId);
-      if (!cur) continue;
-      cur.content = resolved.content;
-      cur.contentPending = false;
-      cur.sig = sig;
-      const templateId = resolved.content.templateId || cur.templateId;
-      cur.templateId = templateId;
-      this._record({
-        source: 'pilot',
-        type: 'change',
-        elementId,
-        templateId,
-        isStripe: this.isStripe(templateId),
-        content: resolved.content,
-        contentPending: false,
-        variant: deriveVariant(resolved.content, this.cfg.line2Field),
-        exclusive: deriveExclusive(resolved.content, this.cfg.exclusiveField),
-        pilotXml: this.cfg.storeRaw ? (resolved.raw || null) : undefined,
-      });
+      // (1) saved Pilot DB element (Line edits that DO write back to Pilot).
+      if (this.cfg.pilotHost) await this._refreshPilotContent(elementId, entry);
+      // (2) live MSE element data (on-air edits, §8.3 — these never reach Pilot).
+      await this._refreshMseContent(elementId, entry);
     }
+  }
+
+  // Pilot-sourced change detection (the saved DB element). Unchanged from Stage 2;
+  // an on-air edit does NOT touch Pilot (§8.3), so this catches only DB writes.
+  async _refreshPilotContent(elementId, entry) {
+    const resolved = await this._fetchContent(elementId);
+    if (!resolved.content) return;
+    const sig = contentSignature(resolved.content);
+    if (sig === entry.sig) return; // no change
+    const cur = this.onAir.get(elementId);
+    if (!cur) return;
+    cur.content = resolved.content;
+    cur.contentPending = false;
+    cur.sig = sig;
+    const templateId = resolved.content.templateId || cur.templateId;
+    cur.templateId = templateId;
+    this._record({
+      source: 'pilot',
+      type: 'change',
+      elementId,
+      templateId,
+      isStripe: this.isStripe(templateId),
+      content: resolved.content,
+      contentPending: false,
+      variant: deriveVariant(resolved.content, this.cfg.line2Field),
+      exclusive: deriveExclusive(resolved.content, this.cfg.exclusiveField),
+      pilotXml: this.cfg.storeRaw ? (resolved.raw || null) : undefined,
+    });
+  }
+
+  // Live-MSE change detection (§8.3 on-air edit). The edited text lives on the MSE
+  // element node's `<entry name="data">` subnodes, read via PepTalk on the actor
+  // socket the recorder already holds. A SEPARATE baseline (entry.mseSig) is kept
+  // because the MSE and Pilot sources can name/shape fields differently — comparing
+  // MSE-against-MSE is the robust signal. The first successful read establishes the
+  // baseline (no emit); later reads emit one `change` when the live signature moves.
+  // An absent/transient live node (e.g. /data/VCP/... when nothing is taken, §8.5)
+  // is tolerated — it simply yields no comparison this tick.
+  async _refreshMseContent(elementId, entry) {
+    const resolved = await this._fetchMseElementData(elementId);
+    if (!resolved || !resolved.content) return; // live node absent — nothing to compare
+    const sig = contentSignature(resolved.content);
+    if (entry.mseSig == null) { entry.mseSig = sig; return; } // establish baseline
+    if (sig === entry.mseSig) return; // identical — no change
+    entry.mseSig = sig;
+    const cur = this.onAir.get(elementId);
+    if (!cur) return;
+    cur.content = resolved.content;
+    cur.contentPending = false;
+    const templateId = resolved.content.templateId || cur.templateId;
+    cur.templateId = templateId;
+    this._record({
+      source: 'mse',
+      type: 'change',
+      elementId,
+      templateId,
+      isStripe: this.isStripe(templateId),
+      content: resolved.content,
+      contentPending: false,
+      variant: deriveVariant(resolved.content, this.cfg.line2Field),
+      exclusive: deriveExclusive(resolved.content, this.cfg.exclusiveField),
+      pilotXml: undefined, // MSE-sourced; no Pilot XML provenance
+    });
+  }
+
+  // Read the LIVE on-air content for an element from the MSE element node's
+  // `<entry name="data">` via the Director adapter's PepTalk socket (§8.3/§8.5).
+  // Follows last_taken's node (the live working copy where on-air edits land) and
+  // falls back to the element's pilotdb node. Returns { content } or { content:null }
+  // when the live node is absent/unreadable. Single-occupancy at this site (one
+  // Stripe on the scheduler line at a time) makes last_taken's node the on-air
+  // element's node; confirm multi-occupancy resolution on the next live trip.
+  async _fetchMseElementData(elementId) {
+    const director = this.adapters.find(
+      (a) => a.source === 'director' && typeof a.getNode === 'function');
+    if (!director) return { content: null };
+    const path = director.lastTakenPath || `/external/pilotdb/elements/${elementId}`;
+    let xml = null;
+    try { xml = await director.getNode(path); } catch (e) { xml = null; }
+    if (!xml) return { content: null };
+    return { content: parseMseElementData(xml, elementId) };
   }
 
   // Called by an adapter's 'off-air' signal. The on-air-map check is the
