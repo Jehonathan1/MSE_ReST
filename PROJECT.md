@@ -99,6 +99,39 @@ key_files: record.js, replay.js, RECORDER.md
   unit-proven, not faked; (3) a template-only take would carry `elementId:null` —
   not a Stripe data element, none in these captures. **Stage-3 issue: CLOSED — the
   capture is sufficient; the bridge can be built against the committed contract.**
+- **(Stage 6b wire fixes) The two live-shoot wire gaps are TWO SEPARATE SIGNALS,
+  fixed independently off-network (branch `wire-fixes-2026-06-23`).** The shoot
+  (§8.5) proved a same-stripe out/in and an on-air edit touch the live MSE/engine
+  through *different* channels, so they need different fixes — neither is the other.
+  - **§4.1 same-stripe out/in — take detection keyed only off `last_taken_element`
+    path changes** (`directorAdapter._handleLastTaken`), which **freeze** on a
+    re-take to the same line, so the re-in emitted no take. The line **A/O** event
+    stream (`/scheduler/*/element/*/lines/LM-Line_*/state/current`, A=on-air/O=off)
+    *was* received and correctly classified as take/out by `offair.parseDirectorEvent`
+    — `_handleDirectorEvent` just never **emitted** a take from an 'A'. **Fix:** emit
+    a take on line state→A, attributed via `lineToElement[lineName]` (populated by the
+    first take; live line frames carry `element=?`) → fallback current active element.
+    The core's on-air map de-dupes the overlap with `last_taken`, so a distinct take
+    is still recorded once; the OUT no longer forgets its line→element map, so the same
+    line returning 'A' resolves back to the same element.
+  - **§8.3 on-air edit — the content-poll re-read only the saved Pilot DB element**
+    (`recorder._refreshOnAirContent → GET /dataelements/<id>`), which an on-air edit
+    never writes back to (caching ruled out: byte-identical body + same etag). The
+    edited text lives in the **MSE document** on the element node's `<entry
+    name="data">` subnodes (API §"Live Update Support"). **Fix:** also source on-air
+    content from there via **PepTalk** on the actor socket already held (`:8595`) —
+    `parseMseElementData` + `directorAdapter.getNode` (read-only `get`) + a **separate
+    `mseSig` baseline** that emits a `change` (`source:'mse'`) when the live signature
+    moves; absent/transient live node tolerated. New content-source: **MSE element data
+    subnodes**, in addition to Pilot REST.
+  - **Both proven reproduce-first** (fixtures + `node --test`, classified through the
+    recorder's own `offair.parseDirectorEvent` — no hand-rolled parser): each new case
+    FAILS on HEAD, PASSES after. **Both still need LIVE CONFIRMATION on the next on-site
+    trip** — the local rig has no live takes/content, so the wire behavior (frozen
+    `last_taken`, the `<entry name="data">` shape/index base, the live `get` path) can't
+    be driven here. Out of scope and untouched: the renderer/viz-to-gsap, off-air
+    detection, the live-server bridge/mapping contract (keys on `type`, not `source`),
+    §4.2 empty-L2 TWO_LINE labeling, §4.3 exclusive field.
 
 ## Stage-1 deliverable: recorder → JSONL → replay (for viz-to-gsap Stage 3/4)
 
