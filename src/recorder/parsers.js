@@ -143,10 +143,26 @@ function parseMseElementData(xmlString, elementId = null) {
 
     const block = extractDataEntry(xmlString);
     if (block != null) {
-      const fieldRe = /<entry name="0*(\d+)"[^>]*>([^<]*)<\/entry>/g;
+      // The LIVE data block nests each field as an outer wrapper entry whose only
+      // child is the value leaf, e.g.:
+      //   <entry description="Line_1" name="01">
+      //     <entry description="Line_1" singleline="true" type="text" name="01">VALUE</entry>
+      //   </entry>
+      // Two things the Stage-1 regex got wrong on the real wire (shoot §8.3 / STEP 3):
+      //   1. `name` is NOT the first attribute (`description` precedes it), so a
+      //      `<entry name="…"` anchored match never fired -> empty fields -> no
+      //      change ever detected on an on-air edit.
+      //   2. The value lives on the inner text LEAF, not the wrapper.
+      // So match every entry tag regardless of attribute order, read `name` out of
+      // its attribute list, and keep only leaves that carry direct text (`[^<]+`).
+      // The wrappers have a child element immediately after `>` (no direct text),
+      // so they never match and are skipped naturally.
+      const leafRe = /<entry\b([^>]*)>([^<]+)<\/entry>/g;
       let m;
-      while ((m = fieldRe.exec(block)) !== null) {
-        const idx = Number(m[1]);
+      while ((m = leafRe.exec(block)) !== null) {
+        const nameMatch = m[1].match(/\bname="0*(\d+)"/);
+        if (!nameMatch) continue;
+        const idx = Number(nameMatch[1]);
         if (!Number.isFinite(idx) || idx < 1) continue; // 4-layer fields are 1-indexed
         const name = String(idx - 1); // 1-indexed MSE -> 0-indexed recorder/Pilot
         const value = decodeEntities(m[2].trim());

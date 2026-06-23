@@ -233,6 +233,32 @@ class DirectorAdapter extends EventEmitter {
           isTemplate: false,
           basedOn: null,
         });
+        return;
+      }
+
+      // Id-less take that local state CANNOT attribute. This is the same-stripe
+      // re-take (shoot §8.6 / STEP 2): the seed take arrived via last_taken (which
+      // sets currentActiveElementId, never lineToElement), then the out nulled
+      // currentActiveElementId — so the re-in 'A' (id-less, line only) resolves to
+      // nothing and the take is dropped. Resolve it from the AUTHORITATIVE on-air
+      // source — the actor's /state/last_taken_element — read on demand right now.
+      // It FREEZES on the stripe element across a same-line out/re-in (shoot §6.1:
+      // 165 FROZEN / 0 CLEARED) so it names the element that just came back, and it
+      // changes to a genuinely different element on a real switch — correct either
+      // way, with no stale-mapping race. Strictly read-only (`get`).
+      if (this.send) {
+        this.getNode('/state/last_taken_element').then((reply) => {
+          const ref = reply && parseLastTakenElement(reply);
+          if (!ref || !ref.elementId) return;
+          this.currentActiveElementId = ref.elementId;
+          if (ev.lineName) this.lineToElement.set(ev.lineName, ref.elementId);
+          this.emit('take', {
+            elementId: ref.elementId,
+            templateId: ref.templateId || null,
+            isTemplate: !!ref.isTemplate,
+            basedOn: ref.basedOn || null,
+          });
+        });
       }
       return;
     }

@@ -271,6 +271,49 @@ class Recorder extends EventEmitter {
       exclusive: resolved.content ? deriveExclusive(resolved.content, this.cfg.exclusiveField) : null,
       pilotXml: this.cfg.storeRaw ? (resolved.raw || null) : undefined,
     });
+
+    // Reconcile the take against the LIVE on-air content (§8.3). The engine renders
+    // the MSE working copy, which can already differ from the saved Pilot element
+    // when a prior on-air edit was never written back to Pilot — e.g. a re-take of
+    // an edited stripe. Read the live node ONCE now to seed the MSE poll baseline at
+    // the take-time value AND emit an immediate correcting `change` when it differs
+    // from the Pilot-sourced take. Without this, the content-poll's first read just
+    // adopts the live value as its silent baseline (_refreshMseContent), so the
+    // mirror stays stuck on the stale Pilot text after the re-take.
+    await this._reconcileLiveContent(ref.elementId, resolved.content);
+  }
+
+  // One-shot take-time reconcile of the live MSE node against the Pilot-sourced take
+  // content. Seeds entry.mseSig and, when the live on-air text differs from the take,
+  // emits a single `change` so the mirror lands on what the engine actually renders.
+  // No-op when the live node is absent (the poll seeds the baseline later) or when
+  // live == take (the common fresh-take case — no spurious change). The texts array
+  // is ordered (Line_1, Line_2, …) identically for the Pilot and MSE parsers, so it
+  // compares cleanly across the two field-key shapes (Pilot "01"/"02" vs MSE 0/1).
+  async _reconcileLiveContent(elementId, takeContent) {
+    const mse = await this._fetchMseElementData(elementId);
+    const live = mse && mse.content;
+    const entry = this.onAir.get(elementId);
+    if (!entry || !live) return; // live node absent — _refreshMseContent seeds later
+    entry.mseSig = contentSignature(live);
+    const takeTexts = (takeContent && takeContent.texts) || [];
+    if (JSON.stringify(live.texts) === JSON.stringify(takeTexts)) return; // live == take
+    entry.content = live;
+    entry.contentPending = false;
+    const templateId = live.templateId || entry.templateId;
+    entry.templateId = templateId;
+    this._record({
+      source: 'mse',
+      type: 'change',
+      elementId,
+      templateId,
+      isStripe: this.isStripe(templateId),
+      content: live,
+      contentPending: false,
+      variant: deriveVariant(live, this.cfg.line2Field),
+      exclusive: deriveExclusive(live, this.cfg.exclusiveField),
+      pilotXml: undefined, // MSE-sourced; no Pilot XML provenance
+    });
   }
 
   async _refreshOnAirContent() {
