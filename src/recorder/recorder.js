@@ -219,6 +219,9 @@ class Recorder extends EventEmitter {
   // Called by an adapter's 'take' signal. `source` is the adapter tag.
   async _onTakeSignal(ref, source) {
     if (this.onAir.has(ref.elementId)) return; // already on air; changes via content-poll
+    // The stripe taken immediately before this one (null on the first take). Used to
+    // scope the take-time live reconcile to a SAME-element re-take — see below.
+    const prevTakenStripeId = this._lastTakenStripeId || null;
     // Reserve the slot synchronously so concurrent signals don't double-fire.
     this.onAir.set(ref.elementId, {
       templateId: ref.templateId || null,
@@ -254,6 +257,7 @@ class Recorder extends EventEmitter {
         if (otherId === ref.elementId) continue;
         if (otherEntry.taken && this.isStripe(otherEntry.templateId)) this._markOffAir(otherId, source);
       }
+      this._lastTakenStripeId = ref.elementId; // remember for the next take's re-take check
     }
 
     this._record({
@@ -272,24 +276,28 @@ class Recorder extends EventEmitter {
       pilotXml: this.cfg.storeRaw ? (resolved.raw || null) : undefined,
     });
 
-    // Reconcile the take against the LIVE on-air content (§8.3). The engine renders
-    // the MSE working copy, which can already differ from the saved Pilot element
-    // when a prior on-air edit was never written back to Pilot — e.g. a re-take of
-    // an edited stripe. Read the live node ONCE now to seed the MSE poll baseline at
-    // the take-time value AND emit an immediate correcting `change` when it differs
-    // from the Pilot-sourced take. Without this, the content-poll's first read just
-    // adopts the live value as its silent baseline (_refreshMseContent), so the
-    // mirror stays stuck on the stale Pilot text after the re-take.
-    await this._reconcileLiveContent(ref.elementId, resolved.content);
+    // Reconcile the take against the LIVE on-air content (§8.3), but ONLY for a
+    // same-element re-take. _fetchMseElementData reads the line's last_taken working
+    // copy (a LINE-scoped node), which is the element being taken ONLY when we re-take
+    // the SAME stripe (out→re-in): there the working copy still holds an unsaved
+    // on-air edit the Pilot take doesn't, and we must surface it immediately. On a
+    // SWITCH to a different stripe the line still renders the OUTGOING element at
+    // take-time, so an immediate read returns the PREVIOUS stripe's text — reconciling
+    // it would emit a spurious change to the wrong headline (then the poll corrects it
+    // a frame later: a visible flicker). For a switch we skip the take-time read and
+    // let the content-poll seed the baseline from a settled read instead.
+    if (this.isStripe(templateId) && ref.elementId === prevTakenStripeId) {
+      await this._reconcileLiveContent(ref.elementId, resolved.content);
+    }
   }
 
   // One-shot take-time reconcile of the live MSE node against the Pilot-sourced take
-  // content. Seeds entry.mseSig and, when the live on-air text differs from the take,
-  // emits a single `change` so the mirror lands on what the engine actually renders.
-  // No-op when the live node is absent (the poll seeds the baseline later) or when
-  // live == take (the common fresh-take case — no spurious change). The texts array
-  // is ordered (Line_1, Line_2, …) identically for the Pilot and MSE parsers, so it
-  // compares cleanly across the two field-key shapes (Pilot "01"/"02" vs MSE 0/1).
+  // content, for a SAME-element re-take only (the caller gates this). Seeds entry.mseSig
+  // and, when the live on-air text differs from the take, emits a single `change` so the
+  // mirror lands on what the engine actually renders. No-op when the live node is absent
+  // (the poll seeds the baseline later) or when live == take (no spurious change). The
+  // texts array is ordered (Line_1, Line_2, …) identically for the Pilot and MSE parsers,
+  // so it compares cleanly across the two field-key shapes (Pilot "01"/"02" vs MSE 0/1).
   async _reconcileLiveContent(elementId, takeContent) {
     const mse = await this._fetchMseElementData(elementId);
     const live = mse && mse.content;
