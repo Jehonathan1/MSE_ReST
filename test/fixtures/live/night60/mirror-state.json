@@ -1,0 +1,32 @@
+{
+  "hold": {
+    "label": "hold (stripe on air)",
+    "mode": "tail",
+    "port": 7901,
+    "ops": [
+      "hold"
+    ]
+  },
+  "clear": {
+    "label": "clear (after engine cleanup)",
+    "mode": "tail",
+    "port": 7902,
+    "ops": [
+      "clear"
+    ]
+  },
+  "streamed": {
+    "label": "streamed lifecycle",
+    "mode": "replay",
+    "port": 7903,
+    "ops": [
+      "reveal",
+      "takeout",
+      "reveal",
+      "takeout",
+      "reveal",
+      "takeout",
+      "session-end"
+    ]
+  }
+}

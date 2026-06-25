@@ -1,0 +1,62 @@
+{
+  "subcommand": "cleanup",
+  "host": "127.0.0.1",
+  "port": 6100,
+  "at": "2026-06-25T20:19:32.090Z",
+  "sent": [
+    {
+      "command": "0 RENDERER*FRONT_LAYER SET_OBJECT",
+      "response": "0 \u0000",
+      "ms": 516,
+      "ts": "2026-06-25T20:19:27.829Z"
+    },
+    {
+      "command": "0 RENDERER*MAIN_LAYER SET_OBJECT",
+      "response": "0 \u0000",
+      "ms": 520,
+      "ts": "2026-06-25T20:19:28.352Z"
+    },
+    {
+      "command": "0 RENDERER*BACK_LAYER SET_OBJECT",
+      "response": "0 \u0000",
+      "ms": 545,
+      "ts": "2026-06-25T20:19:28.897Z"
+    },
+    {
+      "command": "0 SCENE CLEANUP",
+      "response": "0 \u0000",
+      "ms": 530,
+      "ts": "2026-06-25T20:19:29.428Z"
+    },
+    {
+      "command": "0 GEOM CLEANUP",
+      "response": "0 \u0000",
+      "ms": 532,
+      "ts": "2026-06-25T20:19:29.962Z"
+    },
+    {
+      "command": "0 IMAGE CLEANUP",
+      "response": "0 \u0000",
+      "ms": 527,
+      "ts": "2026-06-25T20:19:30.490Z"
+    },
+    {
+      "command": "0 FONT CLEANUP",
+      "response": "0 \u0000",
+      "ms": 536,
+      "ts": "2026-06-25T20:19:31.027Z"
+    },
+    {
+      "command": "0 MATERIAL CLEANUP",
+      "response": "0 \u0000",
+      "ms": 532,
+      "ts": "2026-06-25T20:19:31.559Z"
+    },
+    {
+      "command": "0 MAPS CACHE CLEANUP",
+      "response": "0 \u0000",
+      "ms": 530,
+      "ts": "2026-06-25T20:19:32.090Z"
+    }
+  ]
+}

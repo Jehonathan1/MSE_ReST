@@ -1,0 +1,14 @@
+{
+  "subcommand": "take-out",
+  "host": "127.0.0.1",
+  "port": 6100,
+  "at": "2026-06-25T20:19:44.362Z",
+  "sent": [
+    {
+      "command": "0 RENDERER*FRONT_LAYER SET_OBJECT",
+      "response": "0 \u0000",
+      "ms": 522,
+      "ts": "2026-06-25T20:19:44.361Z"
+    }
+  ]
+}

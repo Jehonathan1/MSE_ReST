@@ -1,0 +1,14 @@
+{
+  "subcommand": "load",
+  "host": "127.0.0.1",
+  "port": 6100,
+  "at": "2026-06-25T20:19:16.067Z",
+  "sent": [
+    {
+      "command": "0 RENDERER*MAIN_LAYER SET_OBJECT SCENE*/Brand/controller_scenes/BUG_TOP_LEFT",
+      "response": "0 <7531F5B7-E1C3-1446-AB1B4F493686BF58>\u0000",
+      "ms": 658,
+      "ts": "2026-06-25T20:19:16.064Z"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+127.0.0.1:6100 (TCP): receive <0 MAIN SWITCH_EXTERNAL OFF>
+127.0.0.1:6100 (TCP): receive <0 MAIN SWITCH_EXTERNAL ON>
+127.0.0.1:6100 (TCP): receive <0 RENDERER*MAIN_LAYER SET_OBJECT SCENE*/Brand/controller_scenes/BUG_TOP_LEFT>
+=== Loading SCENE BUG_TOP_LEFT ===
+=== Loading FONT Cairo_bold-Bold ===
+=== Loading BASE_FONT cairo_bold-bold_20 ===
+=== Loading FONT Cairo_regular-Regular ===
+=== Loading BASE_FONT cairo_regular-regular_12 ===
+TM: Texture 55  (1024x1024 - size: 1368k) on pipe 0 defined.
+TM: Texture 56  (1024x1024 - size: 1368k) on pipe 0 defined.
+127.0.0.1:6100 (TCP): receive <0 RENDERER*FRONT_LAYER SET_OBJECT>
+127.0.0.1:6100 (TCP): receive <0 RENDERER*MAIN_LAYER SET_OBJECT>
+127.0.0.1:6100 (TCP): receive <0 RENDERER*BACK_LAYER SET_OBJECT>
+127.0.0.1:6100 (TCP): receive <0 SCENE CLEANUP>
+TM: Texture 55  (size: 1368k) on pipe 0 removed. 
+TM: Texture 56  (size: 1368k) on pipe 0 removed. 
+127.0.0.1:6100 (TCP): receive <0 GEOM CLEANUP>
+127.0.0.1:6100 (TCP): receive <0 IMAGE CLEANUP>
+127.0.0.1:6100 (TCP): receive <0 FONT CLEANUP>
+127.0.0.1:6100 (TCP): receive <0 MATERIAL CLEANUP>
+127.0.0.1:6100 (TCP): receive <0 MAPS CACHE CLEANUP>
+127.0.0.1:6100 (TCP): receive <0 RENDERER*FRONT_LAYER SET_OBJECT>

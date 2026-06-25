@@ -185,6 +185,46 @@ key_files: record.js, replay.js, RECORDER.md
     emits ANY raw-but-unparsed frame on a cleanup, or truly nothing — re-confirm with
     the exact 2384347-style repro.
 
+- **(Issue 1 / night-60 — engine-console cleanup DETECTION confirmed LIVE at home;
+  self-driven, no other app, no button.)** night-59 built + offline-proved the
+  detector but deferred the live end-to-end because firing a cleanup was a GUI action.
+  night-60 removed that dependency with a **test-only TCP driver** (`scripts/engine-
+  trigger.js`) that replicates — engine-direct over 6100 — the exact commands the MSE
+  fires at the engine during a profile cleanup, run against the **live local engine
+  (Viz 3.14.5.102205)**. The self-run (`scripts/night60-pipeline.js`, 13/13 PASS) drives
+  the REAL `Recorder` + REAL `EngineConsoleAdapter` (real socket, real `CONSOLE
+  REDIRECT` + file tail) and asserts: load → **no** false clear; a faithful cleanup →
+  **exactly one** engine-sourced clear that off-airs the on-air stripe; a single-layer
+  take-out → **no** over-fire; the per-element director off-air still clears. A
+  viz-to-gsap **live-server** mirror over the JSONL (decoupled — JSONL + HTTP only)
+  goes **op=hold → op=clear** (`scripts/night60-mirror-capture.js`, 4/4 PASS). Evidence
+  archived under `test/fixtures/live/night60/` (`RUN.md` + console excerpt + driver
+  command logs + JSONL + mirror state).
+  - **REAL vs SEEDED (honest).** REAL: the engine-console cleanup **detection** leg —
+    the night-59 deferred thing, now live. SEEDED: the MSE **take** (a live MSE take +
+    Pilot content are work-only on the bare rig, so the actor/STOMP legs are stubbed and
+    the on-air element is injected via the recorder's own `_onTakeSignal`). **Still
+    on-site only:** an MSE-driven take + an MSE-driven (`rel="cleanup"`) profile cleanup
+    against a populated profile.
+  - **The home rig needs two engine settings the on-site broadcast engine has standing
+    (Viz External Commands Manual).** `MAIN SHOW_COMMANDS ON` makes the engine echo
+    received commands to the console (without it, `CONSOLE REDIRECT` captures only
+    `JOINING/LEAVING SESSION` — the cleanup is invisible); `MAIN SWITCH_EXTERNAL ON`
+    puts it in on-air/control mode so `SET_OBJECT`/CLEANUP **execute** (else
+    `ERROR … the command is not allowed in this mode`). The **driver** sets these (and
+    restores OFF after); the recorder never does — it stays read-only.
+  - **Live console format ≠ the on-site fixture (locked in).** The live engine echoes
+    commands **wrapped**: `…(TCP): receive <0 SCENE CLEANUP>`, not the bare `SCENE
+    CLEANUP` of `engine-cleanup.console.txt`. The classifier still latches one clear
+    through the wrapper (the CLEANUP verb is a substring match); the bare-only all-layer-
+    unload heuristic is not needed (every real cleanup carries the CACHE CLEANUP block).
+    Deliberately **not** hardened to strip the wrapper — the engine's own `GUI: receive
+    <… SET_OBJECT >` layer clears during the on-air switch would then risk a false
+    all-layer-unload. New fixture `test/fixtures/engine-cleanup.wrapped.console.txt` +
+    `test/engine-trigger.test.js` guard both the driver command shapes and the wrapped
+    format. Read-only throughout; no recorder write path, no MSE POST, no mapper/live-
+    server/conductor change.
+
 ## Stage-1 deliverable: recorder → JSONL → replay (for viz-to-gsap Stage 3/4)
 
 `record.js` writes one JSON object per line (see `RECORDER.md` for the full
@@ -210,6 +250,8 @@ verifier. The bridge maps: take→In, change→Change, off-air→Out, exclusive�
 - `_cleanup-probe.js` — read-only raw events-mode PepTalk tap for the profile-cleanup open question (issue 1)
 - `test/` — regression suite + committed Stripe-lifecycle fixtures
 - `scripts/probe-mse.js` / `scripts/probe-stomp.js` — read-only survey probes
+- `scripts/engine-trigger.js` — **test-only** TCP driver for the LOCAL Viz Engine (6100): replicates the MSE's cleanup command shapes (load/unload/take-out/cleanup + read-only probe/list + rig-setup show-commands/external). Loopback-guarded; the recorder gains no write path (issue 1 / night-60)
+- `scripts/night60-pipeline.js` / `scripts/night60-mirror-capture.js` / `scripts/night60-console-probe.js` — the self-run harnesses that prove the engine-console cleanup detection LIVE (recorder+driver asserts; live-server mirror op=hold→op=clear; transport de-risk). Evidence under `test/fixtures/live/night60/`
 - `LOCAL-MSE-SURVEY.md` — local MSE tree map + "confirm at work" checklist
 - `RECORDER.md` — recorder/replay usage, config, JSONL schema
 - `src/server/index.js` — legacy HTTP + STOMP/WebSocket monitor bridge

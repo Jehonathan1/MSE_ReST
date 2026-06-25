@@ -1,0 +1,58 @@
+[
+  {
+    "name": "baseline: no off-air before any take",
+    "ok": true
+  },
+  {
+    "name": "take 20001 on air",
+    "ok": true
+  },
+  {
+    "name": "load = NO false clear (stripe still on air)",
+    "ok": true,
+    "detail": "onAir=true offAdded=0"
+  },
+  {
+    "name": "cleanup -> exactly one new off-air",
+    "ok": true,
+    "detail": "total off-air=1"
+  },
+  {
+    "name": "cleanup off-air is engine-sourced & is the stripe",
+    "ok": true
+  },
+  {
+    "name": "cleanup cleared the on-air map",
+    "ok": true
+  },
+  {
+    "name": "single take-out = NO global console clear (20002 still on air)",
+    "ok": true,
+    "detail": "onAir=true offAdded=0"
+  },
+  {
+    "name": "per-element take-out still clears the map (20002 off via director)",
+    "ok": true
+  },
+  {
+    "name": "per-element off-air 20003 cleared the map (director)",
+    "ok": true
+  },
+  {
+    "name": "JSONL: exactly 3 off-airs recorded",
+    "ok": true,
+    "detail": "got 3"
+  },
+  {
+    "name": "JSONL: the cleanup off-air (20001) is engine-sourced",
+    "ok": true
+  },
+  {
+    "name": "JSONL: per-element off-airs (20002,20003) are director-sourced",
+    "ok": true
+  },
+  {
+    "name": "JSONL: clean session start+stop bracket",
+    "ok": true
+  }
+]
