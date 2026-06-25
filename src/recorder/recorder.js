@@ -91,6 +91,10 @@ class Recorder extends EventEmitter {
       a.on('take', (ref) => { Promise.resolve(this._onTakeSignal(ref, a.source)).catch(() => {}); });
       a.on('off-air', ({ elementId }) => this._markOffAir(elementId, a.source));
       a.on('state', (snap) => this._record({ source: a.source, type: 'state', channel: snap.channel, active: snap.active }));
+      // A profile/engine CLEAR (cleanup) takes the WHOLE program off air at once —
+      // it names no single element, so the adapter signals it and the core fans it
+      // out over every on-air element. (EngineConsoleAdapter, §issue 4.)
+      a.on('clear', (info) => this._onClearSignal(a.source, info));
     }
   }
 
@@ -142,6 +146,8 @@ class Recorder extends EventEmitter {
     const needStomp = this.adapters.some((a) => a.needsStomp);
     if (needActor) this._connectActor();
     if (needStomp) this._connectStomp();
+    // Engine-console adapters self-own their TCP socket (read-only console tail).
+    for (const a of this.adapters) if (a.needsEngine && a.attachEngine) a.attachEngine();
 
     // Change detection: re-fetch on-air Pilot content on its own interval.
     if (this.cfg.contentPoll) {
@@ -416,6 +422,19 @@ class Recorder extends EventEmitter {
     try { xml = await director.getNode(path); } catch (e) { xml = null; }
     if (!xml) return { content: null };
     return { content: parseMseElementData(xml, elementId) };
+  }
+
+  // Called by an adapter's 'clear' signal (a profile/engine cleanup — §issue 4).
+  // A cleanup empties the WHOLE program at the engine in one shot and names no
+  // element, so the recorder fans it out: off-air EVERY currently on-air element.
+  // The downstream mapper maps each off-air to op=takeout, so a tailing mirror
+  // goes op=hold -> op=clear without any mapper/live-server change. Keys are
+  // snapshotted because _markOffAir deletes from the map while iterating; it also
+  // de-dupes, so a co-arriving per-element off-air is never double-recorded.
+  _onClearSignal(source, info = {}) {
+    const ids = [...this.onAir.keys()];
+    this.log(`[recorder] CLEAR (${source}/${(info && info.reason) || 'cleanup'}) -> off-airing ${ids.length} on-air element(s)`);
+    for (const id of ids) this._markOffAir(id, source);
   }
 
   // Called by an adapter's 'off-air' signal. The on-air-map check is the

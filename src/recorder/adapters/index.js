@@ -17,16 +17,23 @@
 
 const { DirectorAdapter } = require('./directorAdapter');
 const { TrioAdapter } = require('./trioAdapter');
+const { EngineConsoleAdapter } = require('./engineConsoleAdapter');
 
 const VALID_SOURCES = ['director', 'trio', 'auto'];
 
 // deps: { cfg, now, log } — passed through to each adapter.
+//
+// `--source director|trio|auto` selects the take/off-air detector. The engine-
+// console CLEAR detector is ORTHOGONAL (it adds only the profile-cleanup clear a
+// take-out detector can't see) and is OPT-IN via `--engine-console`, so the
+// default recorder is unchanged.
 function buildAdapters(cfg = {}, deps = {}) {
   const source = VALID_SOURCES.includes(cfg.source) ? cfg.source : 'auto';
   const adapters = [];
   if (source === 'director' || source === 'auto') adapters.push(new DirectorAdapter(deps));
   if (source === 'trio' || source === 'auto') adapters.push(new TrioAdapter(deps));
+  if (cfg.engineConsole) adapters.push(new EngineConsoleAdapter(deps));
   return adapters;
 }
 
-module.exports = { buildAdapters, VALID_SOURCES, DirectorAdapter, TrioAdapter };
+module.exports = { buildAdapters, VALID_SOURCES, DirectorAdapter, TrioAdapter, EngineConsoleAdapter };

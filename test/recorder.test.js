@@ -23,7 +23,8 @@ const { parseJsonl, reconstruct, replayFile, ReplayError } = require('../replay'
 const { buildTimeline, sufficiencyReport, emitFile, pickConcurrentStripe } = require('../timeline');
 const { Recorder } = require('../src/recorder/recorder');
 const { parseDirectorEvent } = require('../src/recorder/offair');
-const { DirectorAdapter, TrioAdapter, buildAdapters } = require('../src/recorder/adapters');
+const { parseEngineConsoleLine } = require('../src/recorder/engineConsole');
+const { DirectorAdapter, TrioAdapter, EngineConsoleAdapter, buildAdapters } = require('../src/recorder/adapters');
 
 // In-memory JSONL writer so we can unit-test the recorder's join logic without
 // touching the filesystem or a live MSE.
@@ -53,6 +54,7 @@ const FIX_DELETE = path.join(__dirname, 'fixtures', 'stripe-delete.jsonl');
 const FIX_TRIO = path.join(__dirname, 'fixtures', 'stripe-trio.jsonl');
 const FIX_RESTRIPE_ACTOR = path.join(__dirname, 'fixtures', 'stripe-restripe.actor.json');
 const FIX_ONAIR_EDIT_MSE = path.join(__dirname, 'fixtures', 'stripe-onair-edit.mse.json');
+const FIX_ENGINE_CLEANUP = path.join(__dirname, 'fixtures', 'engine-cleanup.console.txt');
 
 // Stage 3: the three REAL Stage-2d captures the sufficiency check is grounded in.
 // The working captures live in the gitignored recordings/ ("office captures live
@@ -874,4 +876,145 @@ test('the committed 16-event timeline.json equals a fresh re-emit (stable artifa
   const committed = JSON.parse(fs.readFileSync(CAP_16_TIMELINE, 'utf8'));
   const fresh = emitFile(CAP_16, { sourceLabel: '2026-06-17T09-15-40.203Z.jsonl' });
   assert.deepStrictEqual(fresh, committed, 'regenerating the emitter must reproduce the committed artifact');
+});
+
+// === Issue 4: profile/engine CLEANUP detection (engine console 6100) ==========
+//
+// A profile cleanup (`POST /profiles/<p>/cleanup`) is INVISIBLE on the MSE actor
+// stream — it fires at the engine as the all-layer `RENDERER*<LAYER> SET_OBJECT`
+// unload + `… CLEANUP` block (on-site 2026-06-25, ids 552–560). last_taken stays
+// frozen, no per-line off-air, the `/Cleaning up viz-handlers/` log line is not
+// emitted, so the recorder logged 0 lines and downstream mirrors stuck on the last
+// stripe. These tests prove the engine-console classifier + the recorder's clear
+// fan-out, reproduce-first (the live socket/file glue is confirmed on-site).
+
+// --- the pure per-line classifier --------------------------------------------
+test('parseEngineConsoleLine: empty SET_OBJECT = clear; with a scene = load; CLEANUP verbs; noise rejected', () => {
+  // an empty `RENDERER*<LAYER> SET_OBJECT` = a layer UNLOAD (clear)
+  assert.deepStrictEqual(parseEngineConsoleLine('RENDERER*MAIN_LAYER SET_OBJECT'),
+    { kind: 'clear', layer: 'MAIN_LAYER' });
+  assert.deepStrictEqual(parseEngineConsoleLine('RENDERER*FRONT_LAYER SET_OBJECT   '),
+    { kind: 'clear', layer: 'FRONT_LAYER' });
+  // a SET_OBJECT WITH a scene = a LOAD (take), never a clear
+  assert.deepStrictEqual(parseEngineConsoleLine('RENDERER*MAIN_LAYER SET_OBJECT SCENE*i24/stripe'),
+    { kind: 'load', layer: 'MAIN_LAYER', object: 'SCENE*i24/stripe' });
+  // the cleanup-block verbs
+  assert.strictEqual(parseEngineConsoleLine('SCENE CLEANUP').kind, 'cleanup');
+  assert.strictEqual(parseEngineConsoleLine('MAPS CACHE CLEANUP').kind, 'cleanup');
+  assert.strictEqual(parseEngineConsoleLine('MATERIAL CLEANUP').what, 'MATERIAL');
+  // the real idle-console noise must classify as null (no false positive)
+  assert.strictEqual(parseEngineConsoleLine('failed to process command RENDERER*BACK_LAYER*TREE*#17105*GEOM*TYPE'), null);
+  assert.strictEqual(parseEngineConsoleLine('failed to process command RENDERER*MAIN_LAYER SET_OBJECT'), null);
+  assert.strictEqual(parseEngineConsoleLine('TM: Texture 60 none (size: 71k) on pipe 0 removed.'), null);
+  assert.strictEqual(parseEngineConsoleLine('LEAVING SESSION (default): 000001F'), null);
+  assert.strictEqual(parseEngineConsoleLine(''), null);
+});
+
+// --- the adapter latch: one clear per cleanup block; take-out does NOT fire ----
+test('EngineConsoleAdapter: the cleanup block fires exactly one clear', () => {
+  const a = new EngineConsoleAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  const clears = [];
+  a.on('clear', (info) => clears.push(info));
+  a.ingestConsoleLines(fs.readFileSync(FIX_ENGINE_CLEANUP, 'utf8'));
+  assert.strictEqual(clears.length, 1, 'the whole cleanup block emits a single clear');
+  assert.match(clears[0].reason, /cleanup|unload/);
+});
+
+test('EngineConsoleAdapter: a normal take-out (single-layer clear, no CLEANUP block) does NOT fire', () => {
+  const a = new EngineConsoleAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  const clears = [];
+  a.on('clear', (info) => clears.push(info));
+  // a take loads a scene; a per-element take-out empties ONE layer and runs NO
+  // cleanup block — neither is a profile cleanup.
+  a.ingestConsoleLines([
+    'RENDERER*MAIN_LAYER SET_OBJECT SCENE*i24/stripe', // take (load)
+    'RENDERER*MAIN_LAYER SET_OBJECT',                  // take-out: one layer cleared
+  ].join('\n') + '\n');
+  assert.strictEqual(clears.length, 0, 'a single-layer clear with no CLEANUP block is not a profile cleanup');
+});
+
+test('EngineConsoleAdapter: re-arms after a take so a second cleanup fires again', () => {
+  const a = new EngineConsoleAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  const clears = [];
+  a.on('clear', (info) => clears.push(info));
+  a.ingestConsoleLines('SCENE CLEANUP\n');                       // cleanup #1
+  a.ingestConsoleLines('RENDERER*MAIN_LAYER SET_OBJECT SCENE*x\n'); // a take re-arms
+  a.ingestConsoleLines('SCENE CLEANUP\n');                       // cleanup #2
+  assert.strictEqual(clears.length, 2, 'each cleanup after an intervening take fires once');
+});
+
+test('EngineConsoleAdapter: a partial line split across ingest chunks is reassembled', () => {
+  const a = new EngineConsoleAdapter({ cfg: {}, now: () => 't', log: () => {} });
+  const clears = [];
+  a.on('clear', (info) => clears.push(info));
+  a.ingestConsoleLines('SCENE CLEA');   // arrives split mid-line
+  a.ingestConsoleLines('NUP\n');        // completes it
+  assert.strictEqual(clears.length, 1, 'the reassembled cleanup line fires');
+});
+
+// --- buildAdapters: engine console is OPT-IN (default recorder unchanged) ------
+test('buildAdapters: the engine-console clear detector is opt-in via --engine-console', () => {
+  assert.ok(!buildAdapters({ source: 'director' }).some((a) => a.source === 'engine'),
+    'default: no engine adapter (no regression to the standard recorder)');
+  const withEngine = buildAdapters({ source: 'director', engineConsole: true });
+  assert.deepStrictEqual(withEngine.map((a) => a.source), ['director', 'engine']);
+  assert.ok(withEngine.find((a) => a.source === 'engine').needsEngine, 'engine adapter self-owns its socket');
+});
+
+// --- the headline proof: take a stripe -> engine cleanup -> recorder clears ----
+test('Recorder: an engine cleanup off-airs the on-air stripe; replay reconstructs took→left', async () => {
+  const writer = memWriter();
+  let t = 0;
+  const now = () => `2026-06-25T19:00:${String(t++).padStart(2, '0')}.000Z`;
+  const rec = new Recorder(baseCfg({ source: 'director', engineConsole: true, pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now });
+  rec._fetchContent = async (id) => ({
+    content: { elementId: id, templateId: '16097', templateName: 'S', fields: { '0': 'a', '1': 'b' }, texts: ['a', 'b'] },
+    pending: false, error: null, raw: '<x/>',
+  });
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+
+  await rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director');
+  assert.strictEqual(rec.onAir.has('20001'), true, 'the stripe is on air');
+  assert.strictEqual(writer.events.filter((e) => e.type === 'off-air').length, 0, 'no off-air yet');
+
+  // the engine fires the profile cleanup; feed its console block to the adapter.
+  const engine = rec.adapters.find((a) => a.source === 'engine');
+  assert.ok(engine, 'the engine adapter is wired');
+  engine.ingestConsoleLines(fs.readFileSync(FIX_ENGINE_CLEANUP, 'utf8'));
+
+  const offs = writer.events.filter((e) => e.type === 'off-air');
+  assert.strictEqual(offs.length, 1, 'the cleanup off-airs the on-air stripe');
+  assert.strictEqual(offs[0].source, 'engine');
+  assert.strictEqual(offs[0].elementId, '20001');
+  assert.strictEqual(rec.onAir.has('20001'), false, 'removed from the on-air map');
+
+  rec._record({ source: 'recorder', type: 'session', event: 'stop', eventCount: writer.count });
+  const inst = reconstruct(writer.events).stripe;
+  assert.strictEqual(inst.length, 1);
+  assert.ok(inst[0].tookAt && inst[0].leftAt && !inst[0].stillOnAir, 'complete took→left after the cleanup');
+});
+
+// --- the cleanup fans out over EVERY on-air element (stripe + co-airing exclusive) -
+test('Recorder: an engine cleanup off-airs ALL on-air elements (full-program clear)', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', engineConsole: true, pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  const tpl = { 20001: '16097', 20003: '16092' }; // a stripe + a co-airing exclusive
+  rec._fetchContent = async (id) => ({
+    content: { elementId: id, templateId: tpl[id], templateName: 'S', fields: { '0': 'a', '1': 'b' }, texts: ['a', 'b'] },
+    pending: false, error: null, raw: '<x/>',
+  });
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+  await rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director'); // stripe
+  await rec._onTakeSignal({ elementId: '20003', templateId: '16092' }, 'director'); // exclusive co-airs
+  assert.strictEqual(rec.onAir.size, 2, 'both on air before the cleanup');
+
+  rec.adapters.find((a) => a.source === 'engine').ingestConsoleLines('RENDERER*FRONT_LAYER SET_OBJECT\nRENDERER*MAIN_LAYER SET_OBJECT\nSCENE CLEANUP\n');
+
+  const offs = writer.events.filter((e) => e.type === 'off-air').map((e) => e.elementId).sort();
+  assert.deepStrictEqual(offs, ['20001', '20003'], 'the cleanup clears the whole program, not just one element');
+  assert.strictEqual(rec.onAir.size, 0, 'nothing left on air');
 });
