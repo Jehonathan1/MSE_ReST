@@ -123,6 +123,17 @@ function resolveConfig(argv = process.argv.slice(2), env = process.env, cwd = pr
     line2Field: String(pick('line2-field', 'LINE2_FIELD', '1')),
     exclusiveField: pick('exclusive-field', 'EXCLUSIVE_FIELD', null),
 
+    // Engine-console CLEAR detector (opt-in). A profile cleanup is invisible on
+    // the MSE actor stream — it only shows on the Viz Engine command console
+    // (6100) as the all-layer `SET_OBJECT` unload + `… CLEANUP` block. Off by
+    // default so the standard recorder is unchanged; enable with --engine-console.
+    engineConsole: pick('engine-console', 'ENGINE_CONSOLE', false) === true
+      || pick('engine-console', 'ENGINE_CONSOLE', false) === 'true',
+    engineHost: cleanHost(pick('engine-host', 'ENGINE_HOST', null)),
+    enginePort: num(pick('engine-port', 'ENGINE_PORT', 6100), 6100),
+    engineConsoleFile: pick('engine-console-file', 'ENGINE_CONSOLE_FILE', null),
+    engineConsolePollMs: num(pick('engine-console-poll', 'ENGINE_CONSOLE_POLL_MS', 1000), 1000),
+
     outDir: pick('out', 'RECORD_DIR', 'recordings'),
     pollIntervalMs: num(pick('poll-interval', 'POLL_INTERVAL_MS', 2000), 2000),
     // Trio watchdog: warn if no channel-state arrives within this window (a wrong
