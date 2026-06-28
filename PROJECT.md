@@ -60,6 +60,18 @@ key_files: record.js, replay.js, RECORDER.md
   content's `texts[]`** so the FIRST on-air edit registers instead of being swallowed by the
   first working-copy read. Offline-verified 71/71; the live re-confirm of the re-take path is
   still pending (not independently re-exercised on-site).
+- **A bare take-OUT (no replacement) has NO captured off-air signal at this site — do not
+  guess the fix (Defect 5 / night-63, STUCK).** The banked output fixture holds only
+  replacement off-airs (synthesis, same-`ts` as the next take) and cleanups (`source:engine`);
+  a stripe taken out with nothing replacing it is invisible. Both plausible signals are
+  already handled (director line `O`; trio active-set drop) so any offline reproduce-first
+  test PASSES on HEAD — meaning the defect is a **wire/transport** reality (no `O` event
+  and/or `subscribe not_implemented`; STOMP channel-state silent at this Director site), not a
+  parser gap. Resolution is a **read-only live check** of which node moves on a bare OUT
+  (`LM-Line_1 state/current` `O`?, `/state/last_taken_element` frozen vs inexistent?, `/state`
+  `video_playout/.../element_path` clearing?, `/state/playout` / `…_slots_notifications`), then
+  emit one off-air for the outgoing element WITHOUT un-freezing `lastTakenPath` and WITHOUT
+  double-firing on replacement/cleanup. Full report in the issue log below.
 - **Detection is normalized behind adapters: Director = actor, Trio = STOMP.**
   (`src/recorder/adapters/`.) Each adapter only DETECTS and emits the core's
   normalized `take`/`off-air` events tagged with its `source`; the core keeps the
@@ -319,6 +331,118 @@ key_files: record.js, replay.js, RECORDER.md
   - **Live re-confirm still pending** — the re-take path was offline-verified (71/71) but
     not independently re-exercised on-site; flag it for the next live trip. Out of scope &
     untouched: Defects 4 & 5 (separate prompts), the live-server/conductor, viz-to-gsap.
+
+- **(Defect 5 / night-63 — a bare take-OUT leaves the mirror STUCK) — STUCK-REPORT, no fix
+  landed: the bare-OUT signal cannot be confirmed offline, so per PROMPT C + CLAUDE.md the
+  fix is deferred to a read-only live check rather than guessed.** Symptom (on-site
+  2026-06-28): a stripe taken **OUT** with nothing replacing it stays on the mirror; it
+  only clears when the operator takes a DIFFERENT stripe (a replacement) or fires a cleanup.
+  - **Why it cannot be reproduced offline (the blocker).** The banked fixture
+    `recordings/2026-06-28T16-26-42.128Z.jsonl` is the recorder's **output**, and it
+    contains **no bare-OUT instance**: every `off-air` is either `source:engine` (a cleanup
+    — seq 5, seq 19) or a `source:director` off-air at the **exact same `ts`** as the
+    following `take` (seq 7/8, 9/10, 11/12, 14/15, 17/18) — the millisecond-identical
+    signature of the core's **single-occupancy synthesis** in `_onTakeSignal`, NOT a real
+    OUT event. The operator never took a stripe out *without* an immediate replacement (or a
+    cleanup) during this capture, so the symptom's triggering event was never recorded.
+  - **No raw feed exists to characterize the bare OUT.** `recordings/director/*.jsonl` are
+    older recorder **outputs**, not raw actor/STOMP taps. There is no raw `/scheduler` A/O,
+    `/state/playout`, or `/feeds/channelstate` capture of the June-28 session — so the
+    bare-OUT wire shape cannot be reconstructed from committed data.
+  - **The two plausible bare-OUT signals are ALREADY handled by tested code — a
+    reproduce-first test for either PASSES on HEAD (it cannot FAIL-first).**
+    (a) `directorAdapter` emits `off-air` on a line `set …/LM-Line_*/state/current O`
+    (`recorder.test.js` "take via last_taken, then an out…", "off-air does NOT depend on the
+    channel name"); (b) `trioAdapter` emits `off-air` when an element drops from the
+    channel-state active set (`recorder.test.js` "TrioAdapter emits normalized take/off-air",
+    "one off-air, not two"). The real defect is therefore **not** a parsing gap — it is that
+    **neither signal reaches the recorder on the wire at this site**, a transport reality not
+    reproducible from fixtures.
+  - **Prior art rules out the prompt's suggested "channel empties" fix at THIS site.** STOMP
+    channel-state is **silent under the Director path at i24** ("expected, not a bug" — see
+    the Stage-1/2c lessons above: the global feed carries no `based_on`, `last_taken` drives
+    takes). So deriving the bare-OUT off-air "from the channel-state going empty" is a no-op
+    here — the empty frame never arrives. And on a **same-line replacement** the single
+    `LM-Line_1` goes **A→A** (no `O`), which is *why* the core synthesizes the replacement
+    off-air; a bare OUT *should* drive that one line **A→O**, which `directorAdapter` already
+    handles **iff the VDOM event is delivered**. The on-site report that actor `subscribe`
+    returned `not_implemented` (which would suppress ALL external A/O VDOM events, leaving
+    takes to come from the `last_taken` poll and outs to come ONLY from synthesis + cleanup)
+    is the leading hypothesis but is **not decidable from the captured output** alone.
+  - **Read-only live check for the next on-site trip (name the exact nodes/fields).** Do a
+    deliberate **bare OUT** (take one stripe, then OUT with nothing replacing) while a
+    read-only events+poll tap (e.g. `scripts/probe-mse.js` / the `_cleanup-probe.js` events
+    tap) records which of these moves:
+    1. `/scheduler/*/element/*/lines/LM-Line_1/state/current` — does a `set`/`replace`/
+       `delete` carrying **`O`** arrive on the bare OUT? If YES → `directorAdapter` already
+       parses it and the true bug is that **VDOM events aren't being received** (the
+       `subscribe … not_implemented` lead) → fix is at negotiation/subscription, not parsing.
+       If NO event arrives → VDOM is confirmed silent for OUTs.
+    2. `/state/last_taken_element` — after the bare OUT, does it go `error inexistent` / change,
+       or stay **FROZEN** on the outgoing element? (Poll before/after.) An inexistent/empty
+       transition is a poll-detectable bare-OUT signal that does **not** require un-freezing
+       `lastTakenPath` (preserves the night-61b phantom-take guard).
+    3. `/state` → `video_playout/viz_video/channels/<n>/element_path` (+ status
+       `stopped`/playing) — LOCAL-MSE-SURVEY §3 shows `/state` carries the on-air
+       `element_path` and a channel status; `directorAdapter` **already polls `get /state`
+       every 2s but discards the reply**. If `element_path` clears / status → `stopped` on a
+       bare OUT, this is the cleanest poll-based detector.
+    4. `/state/playout` (already SUBSCRIBED, never parsed) and
+       `/state/playout_slots_notifications` — does either emit a frame / go empty on the OUT?
+    5. STOMP `/feeds/channelstate` — re-confirm whether it stays silent (expected) or the
+       active set actually empties (only then is the channel-empty fix viable).
+  - **Then the fix (deferred until one node above is confirmed):** parse whichever node
+    demonstrably transitions on the bare OUT and emit **one** `off-air` for the outgoing
+    element — WITHOUT un-freezing `lastTakenPath` (night-61b), WITHOUT double-firing on a
+    normal replacement (already off-aired by synthesis) or a cleanup (already fanned out by
+    `_onClearSignal`). Reproduce-first becomes possible once a real bare-OUT frame (or a raw
+    tap of one) is banked as a fixture. Out of scope & untouched: Defect 4, Fix C internals,
+    viz-to-gsap. **No code changed in night-63 — investigation + this report only.**
+  - **UPDATE (night-64, new capture `recordings/2026-06-28T14-57-06.517Z.jsonl`, 89 events
+    seq 0–88) — a real director bare-OUT IS now banked, and it confirms the diagnosis:
+    transport/coverage gap, not a parser bug.**
+    - **(a) Evidence — the director adapter DOES emit a bare-OUT `off-air` when `/state/current`
+      O arrives.** Seq 70 is a `source:director` `off-air` of element `2385709` at
+      `16:10:20.581Z` that is **standalone, not replacement-synthesized**: it carries its own
+      `ts`, and the next event (seq 71) is a **re-take of the SAME element `2385709` 3701 ms
+      later** — not the millisecond-identical, different-element pairing that marks the core's
+      single-occupancy synthesis. Surrounding shape: seq 67 take `2385709` → seq 68/69
+      `source:mse` `change` (working-copy edits) → **seq 70 director bare-OUT** → seq 71 re-take.
+      The operator took the stripe OUT with nothing replacing it, the screen cleared for ~3.7 s,
+      then re-took. Every OTHER standalone clear in this capture is `source:engine` (9 of them:
+      seq 5, 11, 13, 15, 43, 49, 66, 73, 88 — engine-console cleanups/clears, not director OUTs);
+      the only other "exact-ts standalone" director off-air, seq 9, is a 1 ms-adjacent
+      replacement of a *different* element (`2384231`→`2381258`), i.e. synthesis jitter, not a
+      bare OUT. **Conclusion:** when the director VDOM `O` is delivered, the bare-OUT is captured
+      correctly — the parser is sound (`test/fixtures/stripe-takeout.actor.json` already PASSES
+      on HEAD; it cannot FAIL-first). The STUCK symptom is therefore a **transport/coverage gap**
+      — it surfaces only when that director `O` does NOT reach the recorder (the
+      `subscribe … not_implemented` lead, or any run whose active source has no bare-OUT signal,
+      e.g. an engine-console-only deployment) — **not** a defect in `offair.js`/`directorAdapter`.
+    - **(b) Candidate FIX SHAPE — an engine-console single-layer-unload fallback.** When the
+      director `O` never arrives, the Viz Engine *still* unloads the stripe's LM layer on a bare
+      OUT (a **single-layer** unload — one empty `SET_OBJECT` for the LM layer), distinct from a
+      profile **cleanup** (all-layer unload + `… CLEANUP` block, already classified by
+      `engineConsole.js` and fanned out via `_onClearSignal`). The fix: have
+      `engineConsoleAdapter` (already tailing 6100 when `--engine-console` is set) classify a
+      lone single-layer LM unload and emit **one** `off-air` for the element on that layer —
+      **de-duped against a director (or trio) `off-air` for the same element within a short
+      window** so it never double-fires on (i) a hot-swap/replacement (the outgoing element is
+      already off-aired by synthesis and the engine swap is a layer A→A, not an unload), or (ii)
+      a cleanup (already an all-layer unload + CLEANUP that `_onClearSignal` owns). This keeps
+      `lastTakenPath` frozen (preserves the night-61b phantom-take guard) and adds a SECOND,
+      transport-independent path to the bare-OUT off-air that does not depend on the director
+      VDOM `O` being delivered — closing the coverage gap that leaves the mirror STUCK.
+    - **(c) Sharpened on-site ask — bank the RAW engine-console bare-OUT signature.** Step 5 of
+      the read-only live check is now the priority: with the `--engine-console` tail (6100)
+      recording, do a deliberate **bare OUT** — take one stripe, then OUT with **nothing
+      replacing it and NO cleanup** — and capture the RAW engine-console lines for that OUT. The
+      goal is the exact **single-layer LM unload signature** (which layer string, the empty
+      `SET_OBJECT` shape, and confirmation that NO `CLEANUP` block accompanies it) so the (b)
+      fallback can be built reproduce-first: that raw line becomes the fixture that FAILs on HEAD
+      (no off-air emitted) → PASSes after the engineConsoleAdapter learns the single-layer
+      unload. Without this raw signature the fallback is still a guess; with it, it is testable
+      offline. **Still no code changed — night-64 enriches the report only.**
 
 ## Stage-1 deliverable: recorder → JSONL → replay (for viz-to-gsap Stage 3/4)
 
