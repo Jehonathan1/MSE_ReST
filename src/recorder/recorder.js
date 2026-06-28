@@ -435,6 +435,15 @@ class Recorder extends EventEmitter {
     const ids = [...this.onAir.keys()];
     this.log(`[recorder] CLEAR (${source}/${(info && info.reason) || 'cleanup'}) -> off-airing ${ids.length} on-air element(s)`);
     for (const id of ids) this._markOffAir(id, source);
+    // A cleanup does NOT reset the actor's last_taken_element (it is a take CURSOR,
+    // not an on-air flag — KB: cleanup never clears last_taken). Drop the stale
+    // cursor/bookkeeping so the next post-cleanup take resolves from the
+    // authoritative last_taken read instead of the now-off-air element: clear the
+    // core's same-element re-take cursor and let each adapter drop its attribution
+    // maps (directorAdapter.handleClear). Without this, an id-less DIRECT take after
+    // a cleanup mirrors the previous (off-air) headline before it snaps (night-61b).
+    this._lastTakenStripeId = null;
+    for (const a of this.adapters) { if (typeof a.handleClear === 'function') a.handleClear(); }
   }
 
   // Called by an adapter's 'off-air' signal. The on-air-map check is the

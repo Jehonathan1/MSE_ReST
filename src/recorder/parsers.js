@@ -263,10 +263,20 @@ function parseChannelState(xmlBody) {
 // --- variant / exclusive derivation ----------------------------------------
 
 // Derive the Stripe variant from content. 1-line vs 2-line is decided by whether
-// the Line_2 field is empty — exactly as the real line2Change script decides
-// (see viz-to-gsap convergence model).
+// Line_2 is empty — exactly as the real line2Change script decides (viz-to-gsap
+// convergence model). Derive from the normalized texts[] (a verbatim mirror of the
+// viz-to-gsap live-mapper): texts holds only non-empty field values in field order,
+// so a present, non-empty texts[1] IS a populated Line_2. This avoids the 0-based vs
+// 1-based field-index bug — getField(line2Field='1') pads to "01", which on 1-based
+// Pilot content is LINE_1, mislabelling every such element TWO_LINE (night-61b). The
+// getField fallback is kept for content that carries fields but no texts[].
 function deriveVariant(content, line2Field = '1') {
-  if (!content || !content.fields) return null;
+  if (!content) return null;
+  if (Array.isArray(content.texts)) {
+    const l2 = content.texts.length >= 2 ? content.texts[1] : '';
+    return l2 && String(l2).trim() ? 'TWO_LINE' : 'ONE_LINE';
+  }
+  if (!content.fields) return null;
   const v = getField(content.fields, line2Field);
   return v && String(v).trim() ? 'TWO_LINE' : 'ONE_LINE';
 }

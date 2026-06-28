@@ -27,7 +27,22 @@ key_files: record.js, replay.js, RECORDER.md
   also strips scheme/port from a host value defensively).
 - **1-line vs 2-line is `is Line_2 empty?`** — a single derivation
   (`deriveVariant`) shared by recorder and replay, matching the real `line2Change`
-  script. Exclusive ("בלעדי") is a separate configurable field.
+  script. Exclusive ("בלעדי") is a separate configurable field. **Derive it from the
+  normalized `texts[]`, not a padded field key** (night-61b): `getField(line2Field='1')`
+  pads to `"01"`, which on 1-based Pilot content is LINE_1 — a false TWO_LINE for every
+  such element. `texts[]` never holds empty strings, so `texts[1]` present+non-empty ⇒
+  TWO_LINE; this mirrors viz-to-gsap's live-mapper verbatim.
+- **`/state/last_taken_element` is a take CURSOR, not an on-air flag — and a cleanup
+  does NOT reset it** (night-61b; KB confirms cleanup never clears last_taken). So after
+  a profile/engine cleanup, drop the recorder's stale attribution bookkeeping on the
+  `clear` (`_lastTakenStripeId` + each adapter's `handleClear()` → director's
+  `lineToElement`/`currentActiveElementId`), or an id-less DIRECT take re-resolves to the
+  now-off-air element and mirrors the previous headline before snapping. Leave
+  `lastTakenPath` frozen (nulling it re-emits the off-air element as a phantom take).
+- **Never fold the live MSE working copy at take-time** (night-61b): it lags ~1.4s after
+  a cleanup→take and serves stale content. Read it only at settled time (the content-poll
+  `_refreshMseContent`), never to attribute the take. The take-time `_reconcileLiveContent`
+  is gated to a same-element re-take and disarmed across a cleanup.
 - **Detection is normalized behind adapters: Director = actor, Trio = STOMP.**
   (`src/recorder/adapters/`.) Each adapter only DETECTS and emits the core's
   normalized `take`/`off-air` events tagged with its `source`; the core keeps the
@@ -224,6 +239,44 @@ key_files: record.js, replay.js, RECORDER.md
     `test/engine-trigger.test.js` guard both the driver command shapes and the wrapped
     format. Read-only throughout; no recorder write path, no MSE POST, no mapper/live-
     server/conductor change.
+
+- **(Defect 1 / night-61b — a cleanup doesn't reset the take cursor, so a direct
+  post-cleanup take mirrored the PREVIOUS headline).** On-site 2026-06-28
+  (viz-to-gsap `convergence/ONSITE-FINDINGS-2026-06-28.md`): after a profile/engine
+  cleanup, taking an element **DIRECTLY** (no playlist initialize) mirrored the
+  previous headline, then snapped to the right one a frame later. **Root cause:** the
+  actor's `/state/last_taken_element` is a take **cursor**, NOT an on-air flag, and a
+  cleanup does **not** reset it (KB: cleanup never clears last_taken — this confirms
+  it). So the next id-less line take resolved to the now-off-air element through the
+  recorder's stale bookkeeping (the director adapter's `lineToElement` /
+  `currentActiveElementId`, and the core's `_lastTakenStripeId` re-take cursor) instead
+  of re-resolving from the authoritative last_taken read.
+  - **Fix (read-only, recorder-side only — no write/POST path).** On a `clear`,
+    `recorder._onClearSignal` now nulls `_lastTakenStripeId` and calls
+    `adapter.handleClear()` on every adapter; `directorAdapter.handleClear()` drops
+    `currentActiveElementId` + `lineToElement`. `lastTakenPath` is left **frozen** on
+    purpose — nulling it would let the next streamed/polled last_taken (still naming
+    the off-air element) re-emit it as a **phantom** take. With the maps cleared, an
+    id-less direct take falls through to the on-demand `get /state/last_taken_element`,
+    which a direct take has advanced to the actually-taken element.
+  - **Reverted misstep (do NOT redo).** Folding the live MSE working copy **at
+    take-time** is wrong: it lags ~1.4s after a cleanup→take and serves stale content.
+    Read it only at **settled** time (the content-poll), never to attribute the take.
+    EDIT 1's `_lastTakenStripeId = null` also disarms the same-element re-take reconcile
+    (`_reconcileLiveContent`) for the post-cleanup re-take, so the lagging copy is not
+    read at take-time.
+  - **Defect 2 mirror.** `deriveVariant` now derives 1-line/2-line from the normalized
+    `texts[]` (a verbatim mirror of viz-to-gsap's live-mapper), not a padded field key:
+    `getField(line2Field='1')` pads to `"01"`, which on **1-based** Pilot content is
+    LINE_1 — mislabelling every such element TWO_LINE. `texts[]` never holds empty
+    strings, so `texts[1]` present+non-empty ⇒ TWO_LINE. The `getField` fallback stays
+    for content carrying `fields` but no `texts`.
+  - **Reproduce-first.** Three tests FAIL on `57a4f45` → PASS after the edits: id-less
+    direct take after a cleanup attributes to the just-taken element (not the frozen
+    cursor); the post-cleanup same-stripe re-take does NOT read/fold the lagging working
+    copy at take-time; `deriveVariant` on 1-based content with an empty Line_2 returns
+    ONE_LINE. `node --test` 69/69 green. Out of scope & untouched: viz-to-gsap (that's
+    61A), engine/MSE writes, the mapper/live-server contract.
 
 ## Stage-1 deliverable: recorder → JSONL → replay (for viz-to-gsap Stage 3/4)
 

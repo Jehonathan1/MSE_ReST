@@ -1018,3 +1018,111 @@ test('Recorder: an engine cleanup off-airs ALL on-air elements (full-program cle
   assert.deepStrictEqual(offs, ['20001', '20003'], 'the cleanup clears the whole program, not just one element');
   assert.strictEqual(rec.onAir.size, 0, 'nothing left on air');
 });
+
+// === Defect 1 (night-61b): cleanup does NOT reset the take cursor =============
+//
+// On-site 2026-06-28: after a profile/engine cleanup, taking an element DIRECTLY
+// (no playlist initialize) mirrored the PREVIOUS headline then snapped. Cause:
+// the actor's last_taken_element is a take CURSOR, not an on-air flag, and a
+// cleanup does NOT reset it — so the next id-less line take resolved to the
+// now-off-air element through the adapter's stale attribution maps (lineToElement
+// / currentActiveElementId) and the core's stale _lastTakenStripeId, instead of
+// re-resolving from the authoritative last_taken read. The fix drops that stale
+// bookkeeping on a clear (recorder._onClearSignal -> adapter.handleClear), so the
+// next post-cleanup take re-resolves cleanly. Reproduce-first: both cases FAIL on
+// 57a4f45 and PASS after EDIT 1+2. The cleanup signal's own fixture is
+// engine-cleanup.console.txt; the takes are driven through a real Recorder.
+
+test('Defect 1 (attribution): an id-less DIRECT take after a cleanup attributes to the just-taken element, not the frozen pre-cleanup cursor', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', engineConsole: true, pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  rec._fetchContent = async (id) => ({
+    content: { elementId: id, templateId: '16097', templateName: 'S', fields: { '0': 'a', '1': 'b' }, texts: ['a', 'b'] },
+    pending: false, error: null, raw: '<x/>',
+  });
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+
+  const d = rec.adapters.find((a) => a.source === 'director');
+  const sent = [];
+  d.send = (f) => sent.push(f); // give the adapter a send channel (no real socket / poll)
+
+  // X taken DIRECTLY on LM-Line_1 (id-bearing 'A') -> on air; lineToElement[L]=X.
+  d.handleActorMessage('* set text /scheduler/s/external/pilotdb/elements/2369176/lines/LM-Line_1/state/current A');
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(rec.onAir.has('2369176'), true, 'X is on air');
+
+  // a profile cleanup fires at the engine -> the recorder fans out an off-air for X.
+  rec.adapters.find((a) => a.source === 'engine').ingestConsoleLines(fs.readFileSync(FIX_ENGINE_CLEANUP, 'utf8'));
+  assert.strictEqual(rec.onAir.has('2369176'), false, 'the cleanup off-aired X');
+
+  // operator takes Y DIRECTLY (no initialize): id-less 'A' on the SAME line. The
+  // authoritative source is /state/last_taken_element, which the cleanup left
+  // pointing past X and a direct take advances to Y.
+  sent.length = 0;
+  d.handleActorMessage('* set text /scheduler/s/show/lines/LM-Line_1/state/current A');
+  const getFrame = [...sent].reverse().find((f) => /get \/state\/last_taken_element/.test(f));
+  if (getFrame) {
+    const id = getFrame.match(/^(\d+)\s/)[1];
+    d.handleActorMessage(`${id} ok {1}<entry name="path">/external/pilotdb/elements/2369200</entry>`);
+  }
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  const postTakes = writer.events.filter((e) => e.type === 'take').slice(1); // after X's first take
+  assert.ok(postTakes.length >= 1, 'the post-cleanup direct take is recorded');
+  assert.strictEqual(postTakes[postTakes.length - 1].elementId, '2369200', 'attributes to the just-taken Y');
+  assert.ok(!postTakes.some((e) => e.elementId === '2369176'),
+    'never re-attributes the post-cleanup take to the now-off-air X (the frozen take cursor)');
+});
+
+test('Defect 1 (guard): a cleanup then a re-take of the SAME stripe does NOT fold the lagging working copy at take-time', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', engineConsole: true, pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  // Pilot serves the FRESH headline for the post-cleanup take.
+  rec._fetchContent = async (id) => ({
+    content: { elementId: id, templateId: '16097', templateName: 'S', fields: { '0': 'FRESH headline', '1': '' }, texts: ['FRESH headline'] },
+    pending: false, error: null, raw: '<x/>',
+  });
+  // The live MSE working copy LAGS ~1.4s after a cleanup->take: it still holds the
+  // PREVIOUS (stale) headline. Folding it at take-time would serve stale content.
+  let mseReads = 0;
+  rec._fetchMseElementData = async () => {
+    mseReads++;
+    return { content: { elementId: '2369176', templateId: '16097', templateName: 'MSE Element', fields: { '0': 'STALE previous headline', '1': '' }, texts: ['STALE previous headline'] } };
+  };
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+
+  // X taken, then a cleanup off-airs it.
+  await rec._onTakeSignal({ elementId: '2369176', templateId: '16097' }, 'director');
+  rec.adapters.find((a) => a.source === 'engine').ingestConsoleLines(fs.readFileSync(FIX_ENGINE_CLEANUP, 'utf8'));
+  assert.strictEqual(rec.onAir.has('2369176'), false, 'the cleanup off-aired the stripe');
+
+  // X is taken AGAIN directly after the cleanup (the on-site repro).
+  await rec._onTakeSignal({ elementId: '2369176', templateId: '16097' }, 'director');
+
+  assert.strictEqual(mseReads, 0, 'the lagging working copy is NOT read at take-time after a cleanup');
+  assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 0, 'no take-time change from the stale working copy');
+  const lastTake = writer.events.filter((e) => e.type === 'take').pop();
+  assert.deepStrictEqual(lastTake.content.texts, ['FRESH headline'], 'the take carries the FRESH Pilot content, not the stale mirror');
+});
+
+// === Defect 2 mirror (night-61b): variant from normalized texts[] ============
+//
+// deriveVariant must derive 1-line/2-line from the normalized texts[] (a verbatim
+// mirror of the viz-to-gsap live-mapper), NOT from a padded field key. On HEAD,
+// 1-based Pilot content ("01"=Line_1 non-empty, "02"=Line_2 empty) with line2Field
+// '1' pads to "01" and reads LINE_1 -> a false TWO_LINE. texts[] (which never
+// holds empty strings) is the correct signal.
+test('Defect 2 mirror: deriveVariant derives from normalized texts[], not the padded field key', () => {
+  // 1-based Pilot content: "01" = Line_1 (non-empty), "02" = Line_2 (empty).
+  const oneLine = { fields: { '01': 'only headline', '02': '' }, texts: ['only headline'] };
+  assert.strictEqual(deriveVariant(oneLine, '1'), 'ONE_LINE',
+    '1-based content with an empty Line_2 is ONE_LINE (was a false TWO_LINE on HEAD)');
+  // texts of length 1 -> ONE_LINE; length 2 (both non-empty) -> TWO_LINE.
+  assert.strictEqual(deriveVariant({ texts: ['a'] }, '1'), 'ONE_LINE');
+  assert.strictEqual(deriveVariant({ texts: ['a', 'b'] }, '1'), 'TWO_LINE');
+});

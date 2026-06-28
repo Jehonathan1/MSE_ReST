@@ -112,14 +112,14 @@ class DirectorAdapter extends EventEmitter {
   // to read live MSE element data (`<entry name="data">`) for §8.3 on-air edits.
   // Resolves with the raw response frame (`<id> ok {len}<xml>`), or null on error /
   // inexistent / timeout / no socket. Strictly `get` — no mutating verb.
-  getNode(path) {
+  getNode(path, timeoutMs) {
     if (!this.send) return Promise.resolve(null);
     const id = this.msgId++;
     this.pending.set(id, 'getnode');
     return new Promise((resolve) => {
       this.getRequests.set(id, resolve);
       this.send(`${id} get ${path}\r\n`);
-      const timeout = (this.cfg && this.cfg.pilotTimeoutMs) || 5000;
+      const timeout = timeoutMs || (this.cfg && this.cfg.pilotTimeoutMs) || 5000;
       setTimeout(() => {
         if (this.getRequests.has(id)) {
           this.getRequests.delete(id);
@@ -285,6 +285,17 @@ class DirectorAdapter extends EventEmitter {
     // element taking the line overwrites the mapping on its own first take.
     if (elementId === this.currentActiveElementId) this.currentActiveElementId = null;
     this.emit('off-air', { elementId });
+  }
+
+  // Called by the core on a profile/engine CLEAR (cleanup). A cleanup leaves the
+  // attribution maps pointing at a now-off-air element — last_taken is a take
+  // cursor, not an on-air flag, and a cleanup does not reset it — so clear them and
+  // the next take re-resolves. lastTakenPath is left FROZEN on purpose: nulling it
+  // would let the next streamed/polled last_taken (still naming the off-air element)
+  // re-emit it as a phantom take. (night-61b.)
+  handleClear() {
+    this.currentActiveElementId = null;
+    this.lineToElement.clear();
   }
 
   stop() {
