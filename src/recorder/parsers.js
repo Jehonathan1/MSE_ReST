@@ -176,6 +176,20 @@ function parseMseElementData(xmlString, elementId = null) {
   }
 }
 
+// Extract the element id a LIVE MSE element node names itself with — the `name`
+// attribute on the root `<element>` tag (confirmed live: `<element name="2380782">`
+// in stripe-onair-edit.mse / stripe-restripe). Used to verify a working-instance
+// read actually BELONGS to the element it was fetched for: last_taken /
+// last_open_template lags a stripe->stripe switch and can name the OUTGOING
+// element's working copy, so the node's own identity is the authority (the path
+// segment's element/template semantics are not relied upon). Returns null if the
+// node carries no `<element name>` (then the caller falls back to trusting the read).
+function parseMseElementName(xmlString) {
+  if (!xmlString) return null;
+  const m = xmlString.match(/<element\b[^>]*\bname="([^"]+)"/);
+  return m ? m[1] : null;
+}
+
 // --- Actor /state/last_taken_element ---------------------------------------
 
 // Extract the element reference from a PepTalk actor reply containing
@@ -304,6 +318,7 @@ module.exports = {
   getField,
   parsePilotElement,
   parseMseElementData,
+  parseMseElementName,
   extractDataEntry,
   parseLastTakenElement,
   resolveBasedOn,

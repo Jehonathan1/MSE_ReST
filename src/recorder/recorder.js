@@ -30,6 +30,7 @@ const W3CWebSocket = require('websocket').w3cwebsocket;
 const {
   parsePilotElement,
   parseMseElementData,
+  parseMseElementName,
   parseLastTakenElement,
   deriveVariant,
   deriveExclusive,
@@ -442,6 +443,17 @@ class Recorder extends EventEmitter {
     let xml = null;
     try { xml = await director.getNode(ref.path); } catch (e) { xml = null; }
     if (!xml) return { content: null };
+    // Cross-attribution guard (Defect 4 / night-64): last_taken / last_open_template
+    // LAGS on a stripe->stripe SWITCH and still names the OUTGOING element's working
+    // copy. The VCP element node authoritatively names its own element via
+    // `<element name="…">` (confirmed live: stripe-onair-edit.mse / stripe-restripe),
+    // so only trust the read when that name matches the element we were asked for;
+    // otherwise the working copy belongs to a different (outgoing) stripe — return
+    // null and let the settled poll seed from a matching read, rather than mislabel
+    // its text onto elementId (the seq 15->16 stale-flicker). A node that carries no
+    // name is tolerated (falls through and is trusted, as before).
+    const nodeId = parseMseElementName(xml);
+    if (nodeId && String(nodeId) !== String(elementId)) return { content: null };
     return { content: parseMseElementData(xml, elementId) };
   }
 

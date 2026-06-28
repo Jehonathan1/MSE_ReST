@@ -60,6 +60,27 @@ key_files: record.js, replay.js, RECORDER.md
   content's `texts[]`** so the FIRST on-air edit registers instead of being swallowed by the
   first working-copy read. Offline-verified 71/71; the live re-confirm of the re-take path is
   still pending (not independently re-exercised on-site).
+- **A stripe SWITCH must not cross-attribute the OUTGOING element's working copy — gate the
+  MSE read on the node's OWN identity (Defect 4 / night-64).** Symptom: switching to a different
+  stripe (and a Line_2 edit of a freshly-switched stripe) showed wrong/old text then corrected — a
+  stale flicker. Banked repro `recordings/2026-06-28T16-26-42.128Z.jsonl` seq 15→16: a fresh take
+  of 2384231 (ONE_LINE) was immediately followed by an `mse` `change` carrying the OUTGOING
+  2385709's on-air-edited TWO_LINE text, mislabeled onto 2384231 (even flipping its variant).
+  Root cause: Fix C made `_fetchMseElementData` resolve `last_taken` freshly, but
+  `last_taken`/`last_open_template` **LAGS** on a stripe→stripe switch and still names the
+  OUTGOING element's VCP working copy, and the code attributed that content to the passed-in
+  `elementId` under the single-occupancy assumption (it never verified the working copy BELONGS to
+  `elementId`). Fix: a live element node authoritatively names itself via `<element name="…">`
+  (confirmed real: `stripe-onair-edit.mse` `<element name="2380782">`, `stripe-restripe`), so
+  `_fetchMseElementData` now reads that name (`parseMseElementName`) and **rejects the read
+  (`{content:null}`) when it ≠ `elementId`** — the settled poll then seeds from a matching read.
+  The `last_open_template` **path-segment** element/template semantics are NOT trusted (no live
+  capture confirms which id it carries) — only the node's own `<element name>` is. The same guard
+  fully covers the reported Line_2-change-shows-stale variant: while `last_taken` lags, every
+  mismatched read is rejected; once it settles to the switched-to element, the genuine Line_2 edit
+  surfaces (variant flips correctly). A node with no `<element name>` is tolerated (trusted, as
+  before). Offline-verified 73/73 (fail-first FAIL on `1efee26` → PASS); live re-confirm of the
+  switch path still pending (not independently re-exercised on-site).
 - **A bare take-OUT (no replacement) has NO captured off-air signal at this site — do not
   guess the fix (Defect 5 / night-63, STUCK).** The banked output fixture holds only
   replacement off-airs (synthesis, same-`ts` as the next take) and cleanups (`source:engine`);
@@ -331,6 +352,40 @@ key_files: record.js, replay.js, RECORDER.md
   - **Live re-confirm still pending** — the re-take path was offline-verified (71/71) but
     not independently re-exercised on-site; flag it for the next live trip. Out of scope &
     untouched: Defects 4 & 5 (separate prompts), the live-server/conductor, viz-to-gsap.
+
+- **(Defect 4 / night-64 — a stripe SWITCH cross-attributed the OUTGOING element's stale
+  working copy).** On-site 2026-06-28: switching to a different stripe (and a Line_2 edit of a
+  freshly-switched stripe) showed wrong/old text, then corrected — a stale flicker. Banked repro
+  `recordings/2026-06-28T16-26-42.128Z.jsonl` seq 15→16: a fresh take of `2384231` (ONE_LINE,
+  `["מפקד סנטקום יגיע לישראל"]`) was immediately followed by an `mse` `change` attributed to
+  `2384231` but carrying the PREVIOUS `2385709`'s on-air-edited TWO_LINE text
+  (`["…לבנון השלישית","…"]`), even flipping its variant to TWO_LINE.
+  - **Root cause.** Fix C made `_fetchMseElementData` resolve `last_taken` freshly and read the
+    VCP working instance, but it then attributed that content to the passed-in `elementId` under
+    the single-occupancy assumption — it never verified the working copy BELONGS to `elementId`.
+    On a stripe→stripe switch `last_taken` / `last_open_template` **lags** and still names the
+    OUTGOING element's working copy, so the content poll read `2385709`'s edit and mislabeled it
+    as `2384231`.
+  - **Fix (read-only, recorder-side only — no write/POST path).** A live element node
+    authoritatively names itself via `<element name="…">` (confirmed real:
+    `stripe-onair-edit.mse` `<element name="2380782">`, `stripe-restripe`). New
+    `parseMseElementName(xml)` reads that name; `_fetchMseElementData` now **rejects the read
+    (`{content:null}`) when the node-name ≠ `elementId`**, so the settled poll seeds from a
+    matching read instead of cross-attributing. The `last_open_template` path-segment
+    element/template semantics are deliberately NOT trusted (no live capture confirms which id it
+    carries) — only the node's own `<element name>` is. A node with no `<element name>` is
+    tolerated (trusted, as before). This also fixes a latent multi-occupancy mis-read (the single
+    global `last_taken` could only ever name one element's working copy; others now correctly
+    return null rather than inherit it).
+  - **Reproduce-first.** Two tests FAIL on `1efee26` → PASS after: a switch where `last_taken`
+    lags to the OUTGOING element is rejected (`{content:null}`) and emits no stale change; a
+    genuine Line_2 edit on the CURRENT element (node-name matches) IS still surfaced (variant
+    flips to TWO_LINE). `node --test` 73/73 green. The **Line_2-change-shows-stale** variant is
+    covered by the same guard (no separate case needed): while `last_taken` lags every mismatched
+    read is rejected; once it settles the genuine edit surfaces.
+  - **Live re-confirm still pending** — offline-verified only; the switch path was not
+    independently re-exercised on-site. Out of scope & untouched: Defect 5, the cleanup path,
+    viz-to-gsap.
 
 - **(Defect 5 / night-63 — a bare take-OUT leaves the mirror STUCK) — STUCK-REPORT, no fix
   landed: the bare-OUT signal cannot be confirmed offline, so per PROMPT C + CLAUDE.md the

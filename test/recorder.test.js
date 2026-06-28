@@ -1212,6 +1212,92 @@ test('Fix C: a genuine surviving VCP working-copy edit is still surfaced on a re
     'the change carries the genuine live edit, not the saved take content');
 });
 
+// === Defect 4 (night-64): a stripe SWITCH must not cross-attribute the outgoing copy ==
+//
+// On-site repro (recordings/2026-06-28T16-26-42.128Z.jsonl seq 15->16): a fresh take of
+// 2384231 (ONE_LINE) was immediately followed by an mse `change` carrying the OUTGOING
+// 2385709's on-air-edited TWO_LINE text, mislabeled onto 2384231 (even flipping its variant
+// to TWO_LINE). Root cause: Fix C made _fetchMseElementData resolve last_taken FRESHLY, but
+// last_taken / last_open_template LAGS on a stripe->stripe switch and still names the
+// OUTGOING element's VCP working copy, so the content poll read 2385709's edit and
+// attributed it to 2384231. The fix gates the read on the VCP node's OWN identity: a live
+// element node names itself via <element name="…"> (confirmed live: stripe-onair-edit.mse
+// <element name="2380782">, stripe-restripe) — a read whose node-name != the element we
+// asked for is rejected ({content:null}) and the settled poll seeds from a matching read.
+// FAIL on 1efee26 (HEAD reads + cross-attributes the lagging node), PASS after.
+
+test('Defect 4: a switch where last_taken lags to the OUTGOING element is rejected, no stale change', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  // Pilot serves the fresh ONE_LINE take for the just-switched-to NEW stripe.
+  rec._fetchContent = async (id) => ({
+    content: { elementId: id, templateId: '16097', templateName: 'S', fields: { '0': 'NEW headline', '1': '' }, texts: ['NEW headline'] },
+    pending: false, error: null, raw: '<x/>',
+  });
+
+  const d = rec.adapters.find((a) => a.source === 'director');
+  // last_taken LAGS: it still names the OUTGOING element's working copy, whose node carries
+  // that element's on-air-edited TWO_LINE text and self-identifies as <element name="2385709">
+  // — NOT the element we just switched to (2384231).
+  const OUT_TEMPLATE = '/scheduler/s/show/dataitems/last_open_template/2385709';
+  d.getNode = async (p) => {
+    if (p === '/state/last_taken_element') return `1 ok {0}<entry name="path">${OUT_TEMPLATE}</entry>`;
+    if (p === OUT_TEMPLATE) return mseElementXml(['OUT edited L1', 'OUT edited L2'], '16097', '2385709');
+    return null;
+  };
+
+  // Direct unit assertion: a read for the NEW element is rejected by the cross-attribution guard.
+  const fetched = await rec._fetchMseElementData('2384231');
+  assert.deepStrictEqual(fetched, { content: null },
+    'the lagging OUTGOING working copy is NOT attributed to the just-switched-to element');
+
+  // Integration: the take of the NEW element + a content poll emits NO spurious mse change.
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+  await rec._onTakeSignal({ elementId: '2384231', templateId: '16097' }, 'director');
+  await rec._refreshOnAirContent();
+  assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 0,
+    'no stale TWO_LINE change cross-attributed onto the fresh ONE_LINE take');
+  const lastTake = writer.events.filter((e) => e.type === 'take').pop();
+  assert.deepStrictEqual(lastTake.content.texts, ['NEW headline'], 'the take keeps its fresh ONE_LINE content');
+});
+
+test('Defect 4 (guard keeps genuine edits): a Line_2 edit on the CURRENT on-air element is still surfaced', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  rec._fetchContent = async (id) => ({
+    content: { elementId: id, templateId: '16097', templateName: 'S', fields: { '0': 'base L1', '1': '' }, texts: ['base L1'] },
+    pending: false, error: null, raw: '<x/>',
+  });
+  const d = rec.adapters.find((a) => a.source === 'director');
+  // last_taken correctly names the CURRENT element; the node self-identifies as 2384231 and
+  // carries a genuine on-air Line_2 edit. This is also the "Line_2-change-shows-stale" variant
+  // settled: once last_taken catches up to the switched-to element, the real edit surfaces.
+  const CUR_TEMPLATE = '/scheduler/s/show/dataitems/last_open_template/2384231';
+  d.getNode = async (p) => {
+    if (p === '/state/last_taken_element') return `1 ok {0}<entry name="path">${CUR_TEMPLATE}</entry>`;
+    if (p === CUR_TEMPLATE) return mseElementXml(['base L1', 'added L2'], '16097', '2384231');
+    return null;
+  };
+
+  // A read for the CURRENT element is trusted (node-name matches).
+  const fetched = await rec._fetchMseElementData('2384231');
+  assert.deepStrictEqual(fetched.content.texts, ['base L1', 'added L2'],
+    'the current element working copy IS read when its node identity matches elementId');
+
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+  await rec._onTakeSignal({ elementId: '2384231', templateId: '16097' }, 'director');
+  await rec._refreshOnAirContent();
+  const changes = writer.events.filter((e) => e.type === 'change');
+  assert.strictEqual(changes.length, 1, 'the genuine on-air edit on the current element is surfaced as one change');
+  assert.strictEqual(changes[0].source, 'mse');
+  assert.deepStrictEqual(changes[0].content.texts, ['base L1', 'added L2']);
+  assert.strictEqual(changes[0].variant, 'TWO_LINE', 'the genuine Line_2 edit flips the variant to TWO_LINE');
+});
+
 // === Defect 2 mirror (night-61b): variant from normalized texts[] ============
 //
 // deriveVariant must derive 1-line/2-line from the normalized texts[] (a verbatim
