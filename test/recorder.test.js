@@ -1110,6 +1110,108 @@ test('Defect 1 (guard): a cleanup then a re-take of the SAME stripe does NOT fol
   assert.deepStrictEqual(lastTake.content.texts, ['FRESH headline'], 'the take carries the FRESH Pilot content, not the stale mirror');
 });
 
+// === Fix C (Defect 3): re-take of an edited stripe must not flash the discarded edit ==
+//
+// On-site repro: a stripe is taken -> on-air-edited -> taken OFF -> re-taken. The re-take
+// reloads the original Pilot content, but the mirror momentarily flashed the DISCARDED
+// edit. Root cause: the take-time reconcile read the live working copy via the Director
+// adapter's CACHED lastTakenPath, which FREEZES on off-air (night-61b) — so on a fresh
+// re-take it still pointed at the prior edited VCP working instance, surfacing the
+// discarded edit as a spurious `change`. Fix C resolves last_taken FRESHLY each reconcile
+// and reads ONLY a VCP working instance: a re-take that reloaded the saved Pilot element
+// (last_taken -> pilotdb, not a template) reads no working copy and emits no stale change,
+// while a genuine surviving template working-copy edit is still surfaced. Both FAIL on
+// 0b1503e, PASS after.
+
+// Build an MSE element `get` reply body parseMseElementData understands (1-indexed
+// data leaves; texts collects non-empty values in order).
+function mseElementXml(texts, templateId = '16097', elementId = '20001') {
+  const leaves = texts.map((t, i) => `<entry name="${i + 1}">${t}</entry>`).join('');
+  return `1 ok {0}<element name="${elementId}">`
+    + `<ref name="master_template">/external/pilotdb/master_templates/${templateId}</ref>`
+    + `<entry name="data">${leaves}</entry></element>`;
+}
+
+test('Fix C: a discarded-edit re-take emits NO stale change and never reads the frozen stale VCP node', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  // The re-take RELOADS the original (fresh) Pilot content — the edit was discarded.
+  rec._fetchContent = async (id) => ({
+    content: { elementId: id, templateId: '16097', templateName: 'S', fields: { '0': 'FRESH headline', '1': '' }, texts: ['FRESH headline'] },
+    pending: false, error: null, raw: '<x/>',
+  });
+
+  const d = rec.adapters.find((a) => a.source === 'director');
+  const reads = [];
+  // The frozen cached path the adapter held from the PRIOR edit (night-61b: it does
+  // NOT clear on off-air). HEAD reads THIS node and surfaces the discarded edit.
+  const STALE_PATH = '/data/VCP/last_open_template/20001';
+  d.lastTakenPath = STALE_PATH;
+  d.getNode = async (p) => {
+    reads.push(p);
+    if (p === STALE_PATH) return mseElementXml(['DISCARDED edit']); // frozen working copy still holds the edit
+    // A FRESH last_taken read: the re-take reloaded the saved Pilot element, so
+    // last_taken now names the pilotdb element (isTemplate=false) — no working copy.
+    if (p === '/state/last_taken_element') return '1 ok {0}<entry name="path">/external/pilotdb/elements/20001</entry>';
+    return null;
+  };
+
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+
+  // take X -> on air; off-air X (the re-take cursor stays X); re-take X (the repro).
+  await rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director');
+  rec._markOffAir('20001', 'director');
+  await rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director');
+
+  assert.strictEqual(writer.events.filter((e) => e.type === 'change').length, 0,
+    'no stale change from the discarded edit on a re-take');
+  assert.ok(!reads.includes(STALE_PATH),
+    'the frozen stale VCP node is never read (last_taken is resolved freshly instead)');
+  const lastTake = writer.events.filter((e) => e.type === 'take').pop();
+  assert.deepStrictEqual(lastTake.content.texts, ['FRESH headline'],
+    'the re-take carries the FRESH Pilot content, not the discarded edit');
+});
+
+test('Fix C: a genuine surviving VCP working-copy edit is still surfaced on a re-take', async () => {
+  const writer = memWriter();
+  const rec = new Recorder(baseCfg({ source: 'director', pilotHost: '10.0.0.5', stripeTemplateId: '16097', line2Field: '1' }),
+    { writer, logger: () => {}, now: () => 't' });
+  // Pilot serves the base take content (no edit).
+  rec._fetchContent = async (id) => ({
+    content: { elementId: id, templateId: '16097', templateName: 'S', fields: { '0': 'take base', '1': '' }, texts: ['take base'] },
+    pending: false, error: null, raw: '<x/>',
+  });
+
+  const d = rec.adapters.find((a) => a.source === 'director');
+  // HEAD's FROZEN cached path names the saved pilotdb element, which has NO edit
+  // (== take) -> HEAD surfaces nothing. The fix resolves last_taken FRESHLY to the
+  // ACTIVE template working instance, which carries the genuine on-air edit.
+  const FROZEN_PILOTDB = '/external/pilotdb/elements/20001';
+  const LIVE_TEMPLATE = '/scheduler/s/show/dataitems/last_open_template/20001';
+  d.lastTakenPath = FROZEN_PILOTDB;
+  d.getNode = async (p) => {
+    if (p === FROZEN_PILOTDB) return mseElementXml(['take base']); // saved element: no edit
+    if (p === '/state/last_taken_element') return `1 ok {0}<entry name="path">${LIVE_TEMPLATE}</entry>`;
+    if (p === LIVE_TEMPLATE) return mseElementXml(['GENUINE live edit']); // working copy carries the edit
+    return null;
+  };
+
+  rec._record({ source: 'recorder', type: 'session', schemaVersion: 1, event: 'start',
+    config: { stripeTemplateId: '16097', line2Field: '1', source: 'director' } });
+
+  await rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director');
+  rec._markOffAir('20001', 'director');
+  await rec._onTakeSignal({ elementId: '20001', templateId: '16097' }, 'director');
+
+  const changes = writer.events.filter((e) => e.type === 'change');
+  assert.strictEqual(changes.length, 1, 'the genuine surviving working-copy edit is surfaced as one change');
+  assert.strictEqual(changes[0].source, 'mse');
+  assert.deepStrictEqual(changes[0].content.texts, ['GENUINE live edit'],
+    'the change carries the genuine live edit, not the saved take content');
+});
+
 // === Defect 2 mirror (night-61b): variant from normalized texts[] ============
 //
 // deriveVariant must derive 1-line/2-line from the normalized texts[] (a verbatim

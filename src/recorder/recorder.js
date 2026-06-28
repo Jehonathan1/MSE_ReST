@@ -30,11 +30,21 @@ const W3CWebSocket = require('websocket').w3cwebsocket;
 const {
   parsePilotElement,
   parseMseElementData,
+  parseLastTakenElement,
   deriveVariant,
   deriveExclusive,
   contentSignature,
 } = require('./parsers');
 const { buildAdapters } = require('./adapters');
+
+// MSE-path content signature. The live on-air working copy (a VCP last_open_template node) and the saved
+// Pilot element name their fields differently (MSE "0"/"1" vs Pilot "01"/"02"), so a field-keyed signature
+// can't be compared across the two. The ORDERED texts[] array is identical across both parsers, so the MSE
+// change detector keys on texts — letting the baseline be seeded from the Pilot-sourced take content and
+// then compared against later MSE-sourced reads.
+function mseTextsSig(content) {
+  return JSON.stringify((content && content.texts) || []);
+}
 
 const SCHEMA_VERSION = 1;
 
@@ -250,6 +260,10 @@ class Recorder extends EventEmitter {
     entry.contentPending = resolved.pending;
     entry.sig = contentSignature(resolved.content);
     entry.taken = true;
+    // Seed the MSE-data baseline from the take content's ORDERED texts now, so the FIRST on-air edit
+    // registers as a change. Without this seed the baseline would be established by the first VCP
+    // working-copy read — which only exists AFTER an edit — silently swallowing that first edit.
+    entry.mseSig = mseTextsSig(resolved.content);
 
     // Single-occupancy: at this site only one Stripe occupies the scheduler line
     // (LM-Line_1) at a time, so a NEW stripe take IS the previous stripe's off
@@ -309,7 +323,7 @@ class Recorder extends EventEmitter {
     const live = mse && mse.content;
     const entry = this.onAir.get(elementId);
     if (!entry || !live) return; // live node absent — _refreshMseContent seeds later
-    entry.mseSig = contentSignature(live);
+    entry.mseSig = mseTextsSig(live);
     const takeTexts = (takeContent && takeContent.texts) || [];
     if (JSON.stringify(live.texts) === JSON.stringify(takeTexts)) return; // live == take
     entry.content = live;
@@ -382,7 +396,7 @@ class Recorder extends EventEmitter {
   async _refreshMseContent(elementId, entry) {
     const resolved = await this._fetchMseElementData(elementId);
     if (!resolved || !resolved.content) return; // live node absent — nothing to compare
-    const sig = contentSignature(resolved.content);
+    const sig = mseTextsSig(resolved.content);
     if (entry.mseSig == null) { entry.mseSig = sig; return; } // establish baseline
     if (sig === entry.mseSig) return; // identical — no change
     entry.mseSig = sig;
@@ -417,9 +431,16 @@ class Recorder extends EventEmitter {
     const director = this.adapters.find(
       (a) => a.source === 'director' && typeof a.getNode === 'function');
     if (!director) return { content: null };
-    const path = director.lastTakenPath || `/external/pilotdb/elements/${elementId}`;
+    let ref = null;
+    try {
+      const ltx = await director.getNode('/state/last_taken_element');
+      ref = parseLastTakenElement(ltx);
+    } catch (e) { ref = null; }
+    // Only the VCP working instance carries on-air edits. Anything else (a pilotdb saved element, or no
+    // resolvable path) → no working copy to read this tick.
+    if (!ref || !ref.isTemplate || !ref.path) return { content: null };
     let xml = null;
-    try { xml = await director.getNode(path); } catch (e) { xml = null; }
+    try { xml = await director.getNode(ref.path); } catch (e) { xml = null; }
     if (!xml) return { content: null };
     return { content: parseMseElementData(xml, elementId) };
   }

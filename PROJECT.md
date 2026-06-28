@@ -43,6 +43,23 @@ key_files: record.js, replay.js, RECORDER.md
   a cleanup→take and serves stale content. Read it only at settled time (the content-poll
   `_refreshMseContent`), never to attribute the take. The take-time `_reconcileLiveContent`
   is gated to a same-element re-take and disarmed across a cleanup.
+- **Re-take of an edited stripe must not flash the discarded edit — resolve `last_taken`
+  FRESHLY, never the frozen `lastTakenPath` (Defect 3 / "Fix C", night-62b).** Symptom: a
+  stripe taken → on-air-edited → taken OFF → re-taken reloaded the original Pilot content
+  but the mirror momentarily flashed the DISCARDED edit. Root cause: the take-time reconcile
+  read the live working copy via the Director adapter's CACHED `lastTakenPath`, which FREEZES
+  on off-air (night-61b), so on a fresh re-take it still pointed at the prior edited VCP
+  working instance — surfacing the discarded edit as a spurious `change`. Fix: `_fetchMseElementData`
+  now resolves `/state/last_taken_element` freshly each call (`parseLastTakenElement`) and reads
+  ONLY a VCP working instance (`ref.isTemplate && ref.path`); a re-take that reloaded the saved
+  Pilot element resolves to a pilotdb ref (not a template) → `{content:null}` → no stale change,
+  while a genuine surviving working-copy edit is still surfaced. Also: the MSE-change detector
+  keys on the ORDERED `texts[]` (`mseTextsSig`), not the field-keyed `contentSignature` — the
+  live working copy ("0"/"1") and the saved Pilot element ("01"/"02") name fields differently,
+  so only `texts[]` compares across the two; and the MSE baseline is **seeded from the take
+  content's `texts[]`** so the FIRST on-air edit registers instead of being swallowed by the
+  first working-copy read. Offline-verified 71/71; the live re-confirm of the re-take path is
+  still pending (not independently re-exercised on-site).
 - **Detection is normalized behind adapters: Director = actor, Trio = STOMP.**
   (`src/recorder/adapters/`.) Each adapter only DETECTS and emits the core's
   normalized `take`/`off-air` events tagged with its `source`; the core keeps the
@@ -277,6 +294,31 @@ key_files: record.js, replay.js, RECORDER.md
     copy at take-time; `deriveVariant` on 1-based content with an empty Line_2 returns
     ONE_LINE. `node --test` 69/69 green. Out of scope & untouched: viz-to-gsap (that's
     61A), engine/MSE writes, the mapper/live-server contract.
+
+- **(Defect 3 / "Fix C" / night-62b — a re-take of an edited stripe flashed the
+  DISCARDED edit).** On-site 2026-06-28 evening
+  (`ONSITE-FINDINGS-2026-06-28-evening.md`): a stripe taken → on-air-edited → taken OFF
+  → **re-taken** reloaded the original Pilot content, but the mirror momentarily flashed
+  the discarded edit. **Root cause:** the take-time reconcile read the live working copy
+  via the Director adapter's CACHED `lastTakenPath`, which FREEZES on off-air (night-61b),
+  so on a fresh re-take it still pointed at the prior edited VCP working instance —
+  surfacing the discarded edit as a spurious `change`.
+  - **Fix (read-only, recorder-side only — no write/POST path).** `_fetchMseElementData`
+    now resolves `/state/last_taken_element` **freshly** each call (`parseLastTakenElement`)
+    and reads ONLY a VCP working instance (`ref.isTemplate && ref.path`); a re-take that
+    reloaded the saved Pilot element resolves to a pilotdb ref (not a template) →
+    `{content:null}` → no stale change, while a genuine surviving working-copy edit is still
+    surfaced. The MSE-change detector now keys on the ORDERED `texts[]` (`mseTextsSig`), not
+    the field-keyed `contentSignature` (live "0"/"1" vs Pilot "01"/"02" name fields
+    differently — only `texts[]` compares across the two), and the MSE baseline is **seeded
+    from the take content's `texts[]`** so the FIRST on-air edit registers instead of being
+    swallowed by the first working-copy read.
+  - **Reproduce-first.** Two tests FAIL on `0b1503e` → PASS after: a discarded-edit re-take
+    emits NO stale change and never reads the frozen stale VCP node; a genuine surviving VCP
+    working-copy edit IS still surfaced. `node --test` 71/71 green.
+  - **Live re-confirm still pending** — the re-take path was offline-verified (71/71) but
+    not independently re-exercised on-site; flag it for the next live trip. Out of scope &
+    untouched: Defects 4 & 5 (separate prompts), the live-server/conductor, viz-to-gsap.
 
 ## Stage-1 deliverable: recorder → JSONL → replay (for viz-to-gsap Stage 3/4)
 
